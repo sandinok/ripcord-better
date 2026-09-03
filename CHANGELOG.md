@@ -5,8 +5,8 @@ Keep a Changelog 1.1.0.
 
 ## 0.1.0 - 2026-09-03
 
-The first Basalt release. Basalt is the renamed and rebuilt successor of
-the Ripcord experiment, with a new name, a new logo, and a real UI.
+The first Basalt release: a new name, a new logo, and a UI that finally
+looks like a real chat client.
 
 ### Added
 

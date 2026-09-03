@@ -48,6 +48,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Lint (clippy)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -57,11 +61,11 @@ jobs:
 
       - name: Package (zip)
         if: matrix.name == 'windows-x86_64'
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
-          (cd dist && zip -q "${{ matrix.archive }}" ${{ matrix.binary }})
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/"
+          Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.archive }}" -Force
 
       - name: Package (tar.gz)
         if: matrix.name != 'windows-x86_64'

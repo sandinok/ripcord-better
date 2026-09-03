@@ -51,19 +51,11 @@ pub fn parse() -> Result<Args, String> {
             other if other.starts_with("--config=") => {
                 a.config = Some(PathBuf::from(other.trim_start_matches("--config=")));
             }
-            other if other.starts_with("-D") => {
-                // -Dkey=value  → RUST_LOG-style directive
-                let _ = other; // accepted but ignored in v0
-            }
             other => {
                 return Err(format!("unknown argument: {other}"));
             }
         }
         i += 1;
-    }
-    if a.verbose >= 1 {
-        // Adjust RUST_LOG via env after-the-fact
-        std::env::set_var("RUST_LOG", if a.verbose >= 2 { "trace" } else { "debug" });
     }
     Ok(a)
 }

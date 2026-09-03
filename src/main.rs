@@ -40,14 +40,6 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon-32.png");
 
 fn main() -> ExitCode {
-    let env = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,basalt=debug,hyper=warn,reqwest=warn,tungstenite=warn")
-    });
-    tracing_subscriber::registry()
-        .with(env)
-        .with(fmt::layer().with_target(false).with_thread_ids(false))
-        .init();
-
     let args = match config::cli::parse() {
         Ok(a) => a,
         Err(e) => {
@@ -55,6 +47,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Parse CLI flags first so -v / -vv can shape the filter, then init
+    // logging. Quiet by default: a GUI app talks through its window, not
+    // through the terminal. RUST_LOG always wins if the user sets it.
+    init_logging(args.verbose);
 
     if args.print_version {
         println!(
@@ -135,6 +132,22 @@ fn main() -> ExitCode {
 
 fn rustc_version() -> &'static str {
     option_env!("RUSTC_VERSION").unwrap_or("stable")
+}
+
+/// Set up `tracing`. Level ladder: default `warn`, `-v` info, `-vv` trace.
+/// `RUST_LOG` (if exported by the user) overrides everything.
+fn init_logging(verbosity: u8) {
+    let level = match verbosity {
+        0 => "warn",
+        1 => "info",
+        _ => "trace",
+    };
+    let env = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("{level},hyper=warn,reqwest=warn,tungstenite=warn")));
+    tracing_subscriber::registry()
+        .with(env)
+        .with(fmt::layer().with_target(false).with_thread_ids(false))
+        .init();
 }
 
 /// Decode the embedded PNG into an `egui::IconData` for window chrome.

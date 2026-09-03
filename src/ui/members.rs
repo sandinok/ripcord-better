@@ -47,8 +47,9 @@ pub fn render(ui: &mut Ui, app_state: &AppState) {
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "member list unavailable (intent?)");
+                            Err(_) => {
+                                // Members intent missing: the panel shows the
+                                // REST-fetched subset instead of the live list.
                             }
                         }
                     });

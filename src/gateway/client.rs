@@ -119,8 +119,9 @@ impl Gateway {
                                 intent_set = intents::FULL;
                                 state.set_intents_limited(false);
                             }
-                            Outbound::SetPresence { status, afk: _ } => {
-                                tracing::debug!(%status, "presence update deferred - not connected yet");
+                            Outbound::SetPresence { .. } => {
+                                // Not connected yet: the status will be sent
+                                // with the IDENTIFY payload on the next connect.
                             }
                             Outbound::Shutdown => { break; }
                         }
@@ -315,7 +316,7 @@ async fn run_connection_loop(
             Some(cmd) = outbound_rx.recv() => {
                 match cmd {
                     Outbound::Connect { .. } => {
-                        tracing::debug!("ignoring redundant Connect while connected");
+                        // Already connected: a redundant Connect is a no-op.
                     }
                     Outbound::SetPresence { status, afk } => {
                         // Mirror the requested status locally too.
@@ -496,8 +497,8 @@ async fn handle_decoded(
                 return Ok(Flow::ReconnectFresh);
             }
         }
-        Some(other) => {
-            tracing::debug!(op = other, "ignored gateway op");
+        Some(_) => {
+            // Ops we do not act on (presence updates, guild subscriptions, ...).
         }
         None => {
             tracing::warn!(raw = %v, "gateway frame missing op");

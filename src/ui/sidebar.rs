@@ -707,8 +707,9 @@ fn resolve_user(rest: Arc<crate::rest::Http>, user_id: Snowflake) {
                     s.touch_user(&u);
                 }
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "resolve user {user_id}");
+            Err(_) => {
+                // Resolution failed; the placeholder avatar stays until
+                // the next presence or member event for this user.
             }
         }
     });

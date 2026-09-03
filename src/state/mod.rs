@@ -499,8 +499,9 @@ impl AppState {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::debug!(error = %e, "fetch unknown DM channel {cid_val}");
+                                Err(_) => {
+                                    // Channel fetch failed; the DM entry is
+                                    // skipped and retried on the next event.
                                 }
                             }
                         });
@@ -595,8 +596,8 @@ impl AppState {
             Event::PresenceRequested { status: _ } => {
                 // Internal UI command - handled by the app layer, not state.
             }
-            Event::Unknown { name, d } => {
-                tracing::debug!(name, keys = ?d.as_object().map(|o| o.keys().collect::<Vec<_>>()), "unhandled event");
+            Event::Unknown { .. } => {
+                // Events we have not modeled yet: nothing to update.
             }
         }
         // Forward to UI for repaint.
