@@ -7,6 +7,9 @@
 // (voice, presence, reaction add/remove, ...). Suppress dead-code lints
 // project-wide so they don't drown out real warnings.
 #![allow(dead_code, clippy::wrong_self_convention)]
+// Release builds on Windows run as a pure GUI app: no console window
+// flashing behind the UI. Debug builds keep the console for tracing.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 // `time::format_description::parse` is marked deprecated in time 0.3.41+ in
 // favor of `parse_borrowed`, but `parse_borrowed` only exists on the
 // `well_known` family. Our use of `parse("[hour]:[minute]")` works on the
