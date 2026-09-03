@@ -37,6 +37,32 @@ pub const MAX_CACHED_USERS: usize = 5_000;
 /// How long a typing indicator stays alive after TYPING_START.
 pub const TYPING_WINDOW: Duration = Duration::from_secs(8);
 
+/// Generate a locally-unique nonce for optimistic message sends. Uses the
+/// OS RNG (via the `getrandom` crate) and stays inside the Discord snowflake
+/// range so it can double as the temporary id of the pending message.
+pub fn new_nonce() -> Snowflake {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut b = [0u8; 8];
+    let _ = getrandom::fill(&mut b);
+    let rand = u64::from_le_bytes(b) & 0x00FF_FFFF_FFFF_FFFF; // 56 bits
+    let ctr = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Mix in a counter so two sends within the same nanosecond can never
+    // collide (which would make the second echo dedupe into the first).
+    Snowflake(rand ^ (ctr.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+}
+
+/// A draft parked by a failed send, plus the human-readable error, waiting
+/// for the UI thread to pick them up on the next frame.
+#[derive(Debug, Clone)]
+struct FailedSend {
+    error: String,
+    /// Text to restore into the composer (the unsent message).
+    draft: String,
+    /// Reply target to restore into the composer.
+    reply_to: Option<Snowflake>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Disconnected,
@@ -97,6 +123,9 @@ pub struct AppState {
     messages: RwLock<HashMap<Snowflake, VecDeque<Message>>>,
     // Channels whose history has been fetched at least once.
     fetched: RwLock<std::collections::HashSet<Snowflake>>,
+    // Per-channel failed sends: the composer picks these up on its next
+    // frame and restores the draft + shows the error. Never auto-retried.
+    failed_sends: RwLock<HashMap<Snowflake, FailedSend>>,
 
     // user_id -> "online" | "idle" | "dnd" | "offline"
     presences: RwLock<HashMap<Snowflake, String>>,
@@ -144,6 +173,7 @@ impl AppState {
             selection: ArcSwap::from_pointee(Selection::default()),
             messages: RwLock::new(HashMap::new()),
             fetched: RwLock::new(std::collections::HashSet::new()),
+            failed_sends: RwLock::new(HashMap::new()),
             presences: RwLock::new(HashMap::new()),
             own_status: ArcSwap::from_pointee("online".to_string()),
             unread: RwLock::new(HashMap::new()),
@@ -278,6 +308,16 @@ impl AppState {
         let cid = msg.channel_id;
         let mut m = self.messages.write();
         let deque = m.entry(cid).or_default();
+        // Nonce resolution: when the gateway delivers MESSAGE_CREATE for a
+        // message we sent optimistically, replace the pending copy instead
+        // of appending (the pending copy has a different temporary id, so
+        // id-based dedupe alone would render the message twice).
+        if let Some(n) = &msg.nonce {
+            if let Some(idx) = deque.iter().position(|x| x.nonce.as_deref() == Some(n.as_str())) {
+                deque[idx] = msg;
+                return;
+            }
+        }
         // De-duplicate by id (REST + gateway can both deliver).
         if deque.iter().any(|x| x.id == msg.id) {
             return;
@@ -286,6 +326,63 @@ impl AppState {
         while deque.len() > MAX_MESSAGES_PER_CHANNEL {
             deque.pop_front();
         }
+    }
+
+    // ── Optimistic (pending) messages ──
+
+    /// Insert the local echo of a message we just sent. Keyed by the nonce;
+    /// `resolve_pending` / gateway MESSAGE_CREATE will replace it.
+    pub fn insert_pending_message(&self, channel_id: Snowflake, msg: &Message) {
+        let mut m = self.messages.write();
+        let deque = m.entry(channel_id).or_default();
+        deque.push_back(msg.clone());
+        while deque.len() > MAX_MESSAGES_PER_CHANNEL {
+            deque.pop_front();
+        }
+    }
+
+    /// Replace the pending echo with the real message (REST response).
+    pub fn resolve_pending(&self, channel_id: Snowflake, nonce: &str, real: Message) {
+        let mut m = self.messages.write();
+        if let Some(deque) = m.get_mut(&channel_id) {
+            if let Some(idx) = deque.iter().position(|x| x.nonce.as_deref() == Some(nonce)) {
+                deque[idx] = real;
+                return;
+            }
+        }
+        // The echo is gone (history refetch replaced it): fall back to a
+        // plain push, with the usual id dedupe.
+        drop(m);
+        self.push_message(real);
+    }
+
+    /// Remove the pending echo of a failed send and park the draft + error
+    /// for the composer to restore. Called only from the failed REST task;
+    /// there is no automatic retry.
+    pub fn fail_pending(&self, channel_id: Snowflake, nonce: &str, error: String) {
+        let mut m = self.messages.write();
+        let mut draft = String::new();
+        let mut reply_to = None;
+        if let Some(deque) = m.get_mut(&channel_id) {
+            if let Some(idx) = deque.iter().position(|x| x.nonce.as_deref() == Some(nonce)) {
+                let pending = deque.remove(idx).unwrap_or_default();
+                draft = pending.content;
+                reply_to = pending.message_reference.and_then(|r| r.message_id);
+            }
+        }
+        drop(m);
+        self.failed_sends
+            .write()
+            .insert(channel_id, FailedSend { error, draft, reply_to });
+        let _ = self.event_tx.send(Event::RepaintRequested);
+    }
+
+    /// Take (consume) a parked failure: (error, draft, reply_to).
+    pub fn take_failed_send(&self, channel_id: Snowflake) -> Option<(String, String, Option<Snowflake>)> {
+        self.failed_sends
+            .write()
+            .remove(&channel_id)
+            .map(|f| (f.error, f.draft, f.reply_to))
     }
 
     pub fn current_user(&self) -> Option<User> {
@@ -599,6 +696,9 @@ impl AppState {
             Event::Unknown { .. } => {
                 // Events we have not modeled yet: nothing to update.
             }
+            Event::RepaintRequested => {
+                // Internal signal only; the UI repaints on any event.
+            }
         }
         // Forward to UI for repaint.
         let _ = self.event_tx.send(event);
@@ -697,6 +797,14 @@ impl Default for AppState {
 
 #[cfg(test)]
 mod tests {
+    /// Drive one async state call from a sync test.
+    fn tokio_block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(f)
+    }
+
     use super::*;
 
     fn msg(id: u64, channel: u64, content: &str) -> Message {
@@ -816,5 +924,78 @@ mod tests {
         assert_eq!(s.messages_for(Snowflake::from_u64(42))[0].reactions[0].count, 1);
         s.apply_reaction(&d, false);
         assert_eq!(s.messages_for(Snowflake::from_u64(42))[0].reactions.len(), 0);
+    }
+
+    // ── optimistic send / nonce ──
+
+    fn nonce_msg(id: u64, nonce: Option<&str>) -> Message {
+        Message {
+            id: Snowflake(id),
+            channel_id: Snowflake(1),
+            author: User::default(),
+            content: "hi".into(),
+            nonce: nonce.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gateway_message_replaces_pending_echo_by_nonce() {
+        let s = AppState::new();
+        s.insert_pending_message(Snowflake(1), &nonce_msg(999, Some("n1")));
+        // The gateway copy has a different (real) id but the same nonce.
+        let e = crate::gateway::events::Event::MessageCreate {
+            d: nonce_msg(1234, Some("n1")),
+        };
+        tokio_block_on(s.dispatch_event(e));
+        let msgs = s.messages_for(Snowflake(1));
+        assert_eq!(msgs.len(), 1, "echo replaced, not appended");
+        assert_eq!(msgs[0].id.0, 1234);
+    }
+
+    #[test]
+    fn resolve_pending_swaps_echo_for_real_message() {
+        let s = AppState::new();
+        s.insert_pending_message(Snowflake(1), &nonce_msg(999, Some("n1")));
+        let mut real = nonce_msg(4321, Some("n1"));
+        real.content = "hi (server copy)".into();
+        s.resolve_pending(Snowflake(1), "n1", real);
+        let msgs = s.messages_for(Snowflake(1));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id.0, 4321);
+        assert_eq!(msgs[0].content, "hi (server copy)");
+    }
+
+    #[test]
+    fn fail_pending_removes_echo_and_parks_draft() {
+        let s = AppState::new();
+        let mut echo = nonce_msg(999, Some("n1"));
+        echo.content = "unsent text".into();
+        s.insert_pending_message(Snowflake(1), &echo);
+        s.fail_pending(Snowflake(1), "n1", "boom".into());
+        assert!(s.messages_for(Snowflake(1)).is_empty(), "echo removed");
+        let (err, draft, _) = s.take_failed_send(Snowflake(1)).expect("parked failure");
+        assert_eq!(err, "boom");
+        assert_eq!(draft, "unsent text");
+        assert!(s.take_failed_send(Snowflake(1)).is_none(), "taken once");
+    }
+
+    #[test]
+    fn nonces_are_unique() {
+        let mut set = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(set.insert(new_nonce()));
+        }
+    }
+
+    #[test]
+    fn plain_gateway_message_still_dedupes_by_id() {
+        let s = AppState::new();
+        let e = crate::gateway::events::Event::MessageCreate {
+            d: nonce_msg(7, None),
+        };
+        tokio_block_on(s.dispatch_event(e.clone()));
+        tokio_block_on(s.dispatch_event(e));
+        assert_eq!(s.messages_for(Snowflake(1)).len(), 1);
     }
 }

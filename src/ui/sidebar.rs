@@ -41,11 +41,44 @@ pub fn render(
                     .map(|g| g.name.clone())
                     .unwrap_or_else(|| "Unknown server".into())
             };
-            let (header_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::hover());
+            // ── Header (48px, taller 135px when the guild has a banner) ──
+            let banner = if home {
+                None
+            } else {
+                app_state.guild_by_id(sel.guild_id.unwrap()).and_then(|g| g.banner_url())
+            };
+            let header_h = if banner.is_some() { 135.0 } else { 48.0 };
+            let (header_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), header_h), Sense::hover());
             let painter = ui.painter_at(header_rect);
             painter.rect_filled(header_rect, 0.0, colors::BG_SIDEBAR);
+            if let Some(url) = banner {
+                // Banner image, cover-fit, with a gradient fade into the
+                // sidebar so the channel list grows out of it naturally.
+                crate::image_loader::draw_cover_image(ui, header_rect, &url, 600, 240);
+                // Bottom fade into the sidebar: stacked translucent slices
+                // (egui has no gradient primitive; 8 slices read as smooth).
+                const BG: (u8, u8, u8) = (0x2B, 0x2D, 0x31);
+                for i in 0..8 {
+                    let a = (i as f32 / 7.0 * 255.0) as u8;
+                    let h = 44.0 / 8.0;
+                    let r = Rect::from_min_size(
+                        egui::pos2(header_rect.min.x, header_rect.max.y - 44.0 + i as f32 * h),
+                        egui::vec2(header_rect.width(), h + 1.0),
+                    );
+                    ui.painter().rect_filled(
+                        r,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(BG.0, BG.1, BG.2, a),
+                    );
+                }
+            }
+            let text_y = if header_h > 48.0 {
+                header_rect.max.y - 24.0
+            } else {
+                header_rect.center().y
+            };
             painter.text(
-                egui::pos2(header_rect.min.x + 16.0, header_rect.center().y),
+                egui::pos2(header_rect.min.x + 16.0, text_y),
                 egui::Align2::LEFT_CENTER,
                 &header_text,
                 egui::FontId::proportional(15.0),
@@ -54,7 +87,7 @@ pub fn render(
             crate::icons::draw(
                 ui.painter(),
                 "expand_more",
-                egui::pos2(header_rect.max.x - 22.0, header_rect.center().y),
+                egui::pos2(header_rect.max.x - 22.0, text_y),
                 18.0,
                 colors::TEXT_TERTIARY,
             );

@@ -176,24 +176,4 @@ pub mod intents {
 /// gateway-spec.md.
 pub const CLIENT_CAPABILITIES: u32 = 16381;
 
-/// Properties we send in the `identify.properties` field. Discord stores
-/// these for telemetry; the values must look like a real client to avoid
-/// Cloudflare bot-detection heuristics (research/rest-spec.md §10).
-pub fn client_properties() -> serde_json::Value {
-    serde_json::json!({
-        "os": "Windows",
-        "browser": "Chrome",
-        "device": "",
-        "system_locale": "en-US",
-        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-        "browser_version": "127.0.0.0",
-        "os_version": "15",
-        "referrer": "https://discord.com",
-        "referring_domain": "discord.com",
-        "referrer_current": "",
-        "referring_domain_current": "",
-        "release_channel": "stable",
-        "client_build_number": 387_127, // verified 2026-08 — bump if stale
-        "client_event_source": None::<()>,
-    })
-}
+

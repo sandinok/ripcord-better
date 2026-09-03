@@ -3,6 +3,69 @@
 All notable changes to Basalt are documented here. The format follows
 Keep a Changelog 1.1.0.
 
+## 0.1.1 - 2026-09-03
+
+The safety and completeness release. One Enter sends exactly one message,
+your own messages appear instantly, and the client presents a consistent,
+browser-shaped identity to Discord so sessions read as normal usage.
+
+### Fixed
+
+- Double sends are structurally impossible now. The composer consumes the
+  Enter key event (exactly-once semantics), sends go through a single
+  worker queue (one POST per message, in order), and every message carries
+  a nonce that dedupes the optimistic copy against the REST response and
+  the gateway MESSAGE_CREATE event. An automated test presses Enter once
+  and asserts, via the API, that exactly one message exists on the server.
+- No request is ever resent automatically. A failed send removes the
+  optimistic copy, restores the draft into the composer and shows the
+  error inline ("your message was not sent"). Retrying is a human
+  decision, never a client decision.
+- 429 responses now wait the full Retry-After (body JSON first, header
+  fallback), mark the bucket exhausted for concurrent requests, and
+  surface the failure to the UI instead of silently retrying.
+- Gateway reconnects use exponential backoff (1s to 60s) with full jitter,
+  reset after a connection survives 30 seconds. No more reconnect storms.
+- A nonce arriving as a JSON number (how the official client sends it) no
+  longer fails MESSAGE_CREATE parsing, which used to drop those messages
+  from the chat.
+- The settings modal stays open: the click that opens it no longer
+  immediately counts as a backdrop click that closes it.
+- The reaction picker no longer flash-closes on the click that opened it
+  (same one-frame-click class of bug as the settings modal).
+- Messages you send appear instantly: an optimistic copy renders on Enter
+  and is replaced by the real message when the first delivery arrives.
+- Selecting a channel or DM returns keyboard focus to the composer, so
+  typing right after a click lands in the message box (it used to go
+  nowhere after clicking a DM row).
+- Bot accounts keep their DM list across restarts: Basalt remembers DMs
+  it has seen and re-fetches them at startup (the API gives bots no DM
+  list).
+
+### Added
+
+- Emoji reaction picker: hover a message, click the smiley, get a Discord
+  style popup with a search box and a grid of 130 color Twemoji; the
+  chosen reaction is sent and renders live.
+- Guild banner at the top of the channel sidebar with a gradient fade,
+  like the official client (when the server has a banner).
+- Embed images: link unfurls render their thumbnail (small, top-right,
+  like Discord) and their main image below the description. Titles are
+  clickable and open in the browser.
+- The client identity is consistent end to end: the HTTP User-Agent, the
+  gateway IDENTIFY properties and the websocket handshake all describe
+  the same Chromium-on-your-OS client, with a current build number and a
+  per-launch id (modeled after the reference open-source clients). Bot
+  sessions keep the documented bot User-Agent and honest properties.
+- The websocket handshake sends Origin and a matching User-Agent, like a
+  browser.
+- New logo render with depth (top-lit center column, ground shadow) and
+  embedded icons: the Windows exe carries a multi-size .ico (Explorer,
+  taskbar, window chrome) and the macOS download is a proper .app bundle
+  with an .icns.
+- Server icons are rounder at rest (r22 of 48) and still morph to full
+  circles on hover/selection.
+
 ## 0.1.0 - 2026-09-03
 
 The first Basalt release: a new name, a new logo, and a UI that finally

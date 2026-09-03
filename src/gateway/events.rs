@@ -46,6 +46,10 @@ pub enum Event {
     /// INTERNAL (never arrives from the wire): the UI wants to change the
     /// user's own presence; the app layer forwards this to the gateway.
     PresenceRequested { status: String },
+    /// INTERNAL (never arrives from the wire): a background task changed
+    /// state the UI renders (e.g. a failed send parked a draft); the app
+    /// layer answers with a repaint.
+    RepaintRequested,
     /// Unknown event — captured for logging only.
     Unknown { name: String, d: Value },
 }

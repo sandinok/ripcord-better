@@ -23,6 +23,16 @@ pub struct ChatState {
     pub auto_scroll: bool,
     /// Focus the composer as soon as a channel is selected (Discord-like).
     pub want_composer_focus: bool,
+    /// Message the emoji picker is currently open for (hover "add reaction").
+    pub reaction_picker_for: Option<Snowflake>,
+    /// Live filter text of the emoji picker.
+    pub reaction_search: String,
+    /// When the emoji picker was opened; outside-clicks are ignored for a
+    /// short grace window so the opening click cannot close it instantly.
+    pub reaction_picker_opened: Option<std::time::Instant>,
+    /// Last send error, shown inline above the composer until the user
+    /// starts typing again. `None` normally; sends never auto-retry.
+    pub send_error: Option<String>,
 }
 
 impl Default for ChatState {
@@ -33,6 +43,10 @@ impl Default for ChatState {
             spoilers_revealed: HashSet::new(),
             auto_scroll: true,
             want_composer_focus: true,
+            reaction_picker_for: None,
+            reaction_search: String::new(),
+            reaction_picker_opened: None,
+            send_error: None,
         }
     }
 }
@@ -41,6 +55,7 @@ pub fn render(
     ui: &mut Ui,
     app_state: &AppState,
     rest: Arc<crate::rest::Http>,
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
     chat_state: &mut ChatState,
     config: &mut crate::config::Config,
 ) {
@@ -70,7 +85,7 @@ pub fn render(
             .frame(egui::Frame::new().fill(colors::BG_CHAT).inner_margin(egui::Margin::same(0)))
             .show_separator_line(false)
             .show(ui, |ui| {
-                render_composer(ui, app_state, rest, chat_state, None);
+                render_composer(ui, app_state, sender, chat_state, None);
             });
         return;
     };
@@ -94,7 +109,7 @@ pub fn render(
         .show_separator_line(false)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            render_composer(ui, app_state, rest.clone(), chat_state, Some(&ch));
+            render_composer(ui, app_state, sender, chat_state, Some(&ch));
         });
 
     // ── Message history (fills everything between) ──
@@ -134,6 +149,35 @@ pub fn render(
     let inner = scroll_output.content_size.y;
     let outer = scroll_output.inner_rect.height();
     chat_state.auto_scroll = !(outer < inner && offset < inner - outer - 4.0);
+
+    // ── Reaction picker popup (one per frame, anchored at its message) ──
+    if let Some(pid) = chat_state.reaction_picker_for {
+        let anchor = ui
+            .ctx()
+            .data(|d| d.get_temp::<egui::Pos2>(egui::Id::new("picker_anchor").with(pid.0)));
+        if let Some(anchor) = anchor {
+            if let Some(emo) = crate::ui::reaction_picker::show(
+                ui,
+                &mut chat_state.reaction_picker_for,
+                &mut chat_state.reaction_search,
+                chat_state.reaction_picker_opened,
+                pid,
+                anchor,
+            ) {
+                // Send the reaction and close the picker.
+                chat_state.reaction_picker_for = None;
+                chat_state.reaction_search.clear();
+                chat_state.reaction_picker_opened = None;
+                let rest_clone = rest.clone();
+                let cid_v = ch.id;
+                tokio::spawn(async move {
+                    if let Err(e) = rest_clone.create_reaction(cid_v, pid, &emo).await {
+                        tracing::warn!(error = %e, "add reaction");
+                    }
+                });
+            }
+        }
+    }
 }
 
 // ───────────────────────────── header ─────────────────────────────
@@ -306,7 +350,6 @@ fn render_message_row(
         });
 
     let mut reply_clicked: Option<Snowflake> = None;
-    let mut quick_react: Option<(Snowflake, &str)> = None;
 
     let inner = frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
@@ -444,7 +487,7 @@ fn render_message_row(
                 }
             });
 
-            // Hover actions (reply + quick reaction), right-aligned.
+            // Hover actions (reply + add reaction), right-aligned.
             if hovered_prev {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                     let (r1, resp1) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
@@ -459,12 +502,31 @@ fn render_message_row(
                         .on_hover_text("Add reaction");
                     crate::icons::draw(ui.painter(), "mood", r2.center(), 18.0, colors::TEXT_TERTIARY);
                     if resp2.clicked() {
-                        quick_react = Some((msg.id, "🔥"));
+                        // Toggle the emoji picker for this message.
+                        if chat_state.reaction_picker_for == Some(msg.id) {
+                            chat_state.reaction_picker_for = None;
+                            chat_state.reaction_picker_opened = None;
+                        } else {
+                            chat_state.reaction_picker_for = Some(msg.id);
+                            chat_state.reaction_picker_opened =
+                                Some(std::time::Instant::now());
+                        }
+                    }
+                    if chat_state.reaction_picker_for == Some(msg.id) {
+                        // Publish the anchor so chat::render can position the
+                        // popup after the loop (it renders once per frame).
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(
+                                egui::Id::new("picker_anchor").with(msg.id.0),
+                                r2.right_center(),
+                            );
+                        });
                     }
                 });
             }
         });
     });
+
 
     // Store hover state for the next frame (one-frame lag, imperceptible).
     let hovered = inner.response.hovered() || ui.rect_contains_pointer(inner.response.rect);
@@ -473,15 +535,6 @@ fn render_message_row(
     if let Some(target) = reply_clicked {
         chat_state.reply_to = Some(target);
         chat_state.want_composer_focus = true;
-    }
-    if let Some((mid, emo)) = quick_react {
-        let rest_clone = rest.clone();
-        let cid = msg.channel_id;
-        tokio::spawn(async move {
-            if let Err(e) = rest_clone.create_reaction(cid, mid, emo).await {
-                tracing::warn!(error = %e, "add reaction");
-            }
-        });
     }
 }
 
@@ -541,6 +594,52 @@ fn render_attachments(ui: &mut Ui, msg: &Message) {
     }
 }
 
+/// Author line + title of an embed card (shared by both thumbnail layouts).
+fn render_embed_header(ui: &mut Ui, e: &crate::model::Embed) {
+    if let Some(author) = &e.author {
+        ui.horizontal(|ui| {
+            if let Some(icon) = &author.icon_url {
+                crate::image_loader::render_image(
+                    ui,
+                    icon,
+                    22.0,
+                    crate::image_loader::Shape::Circle,
+                );
+            }
+            ui.label(
+                egui::RichText::new(&author.name)
+                    .size(13.0)
+                    .color(colors::TEXT_PRIMARY)
+                    .strong(),
+            );
+        });
+    }
+    if let Some(title) = &e.title {
+        if let Some(url) = &e.url {
+            if ui
+                .link(
+                    egui::RichText::new(title)
+                        .size(15.0)
+                        .color(colors::TEXT_LINK)
+                        .strong(),
+                )
+                .clicked()
+            {
+                // Open the source link in the system browser.
+                let u = url.clone();
+                let _ = open::that_detached(&u);
+            }
+        } else {
+            ui.label(
+                egui::RichText::new(title)
+                    .size(15.0)
+                    .color(colors::TEXT_PRIMARY)
+                    .strong(),
+            );
+        }
+    }
+}
+
 fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32) {
     for e in &msg.embeds {
         let color = e.color.unwrap_or(0x1F_8B_4C) >> 8;
@@ -556,25 +655,52 @@ fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32) {
         frame.show(ui, |ui| {
             ui.set_max_width(432.0);
             ui.vertical(|ui| {
-                if let Some(title) = &e.title {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(16.0)
-                            .color(colors::TEXT_PRIMARY)
-                            .strong(),
-                    );
-                }
-                if let Some(desc) = &e.description {
-                    ui.add_space(4.0);
-                    let mut revealed = std::collections::HashSet::<usize>::new();
-                    markdown::render_message_content(
-                        ui,
-                        desc,
-                        &NoLookup,
-                        (font_size - 1.0).max(12.0),
-                        (msg.id.0 as usize) ^ 0xEBED,
-                        &mut revealed,
-                    );
+                // Discord layout: the small thumbnail (80px) sits at the top
+                // right, beside the author/title; the big image renders below
+                // the description. Only `embed.image` is "big media".
+                let has_thumb = e.thumbnail.is_some();
+                if has_thumb {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(432.0 - 12.0 - 80.0 - 12.0);
+                            render_embed_header(ui, e);
+                            if let Some(desc) = &e.description {
+                                ui.add_space(2.0);
+                                let mut revealed = std::collections::HashSet::<usize>::new();
+                                markdown::render_message_content(
+                                    ui,
+                                    desc,
+                                    &NoLookup,
+                                    (font_size - 1.0).max(12.0),
+                                    (msg.id.0 as usize) ^ 0xEBED,
+                                    &mut revealed,
+                                );
+                            }
+                        });
+                        let thumb = e.thumbnail.as_ref().unwrap();
+                        if let Some(url) = thumb.proxy_url.as_ref().or(Some(&thumb.url)) {
+                            crate::image_loader::render_image(
+                                ui,
+                                url,
+                                80.0,
+                                crate::image_loader::Shape::Rounded(4),
+                            );
+                        }
+                    });
+                } else {
+                    render_embed_header(ui, e);
+                    if let Some(desc) = &e.description {
+                        ui.add_space(2.0);
+                        let mut revealed = std::collections::HashSet::<usize>::new();
+                        markdown::render_message_content(
+                            ui,
+                            desc,
+                            &NoLookup,
+                            (font_size - 1.0).max(12.0),
+                            (msg.id.0 as usize) ^ 0xEBED,
+                            &mut revealed,
+                        );
+                    }
                 }
                 for f in &e.fields {
                     ui.add_space(4.0);
@@ -597,6 +723,23 @@ fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32) {
                             .size(12.0)
                             .color(colors::TEXT_TERTIARY),
                     );
+                }
+                // Big embed media (link unfurls, GIF posts): the image
+                // Discord shows large under the description.
+                if let Some(img) = e.image.as_ref() {
+                    if let Some(url) = img.proxy_url.as_ref().or(Some(&img.url)) {
+                        ui.add_space(4.0);
+                        let w = img
+                            .width
+                            .map(|w| (w as f32).clamp(64.0, 384.0))
+                            .unwrap_or(384.0);
+                        crate::image_loader::render_image(
+                            ui,
+                            url,
+                            w,
+                            crate::image_loader::Shape::Rounded(6),
+                        );
+                    }
                 }
             });
         });
@@ -649,7 +792,7 @@ fn render_reactions(ui: &mut Ui, msg: &Message, _rest: Arc<crate::rest::Http>) {
 fn render_composer(
     ui: &mut Ui,
     app_state: &AppState,
-    rest: Arc<crate::rest::Http>,
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
     chat_state: &mut ChatState,
     channel: Option<&Channel>,
 ) {
@@ -713,6 +856,35 @@ fn render_composer(
 
     // Composer card.
     ui.add_space(4.0);
+
+    // Restore a draft when a send failed: the text and error are parked in
+    // the shared state by the failing task (it runs on a worker thread and
+    // cannot touch the UI-owned ChatState directly).
+    if let Some(cid_val) = cid {
+        if let Some((err, draft, reply_to)) = app_state.take_failed_send(cid_val) {
+        chat_state.input = draft;
+        chat_state.reply_to = reply_to.or(chat_state.reply_to);
+        chat_state.send_error = Some(err);
+        chat_state.want_composer_focus = true;
+        }
+    }
+
+    // Inline send-error line ("nothing was sent" is stated explicitly so
+    // nobody re-sends blind and doubles a message).
+    if let Some(err) = chat_state.send_error.clone() {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+            crate::icons::draw(ui.painter(), "error", r.center(), 14.0, colors::RED);
+            ui.label(
+                egui::RichText::new(format!("{err} Your message was not sent."))
+                    .size(12.0)
+                    .color(colors::RED),
+            );
+        });
+        ui.add_space(2.0);
+    }
+
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         let card_w = ui.available_width() - 16.0;
@@ -756,15 +928,37 @@ fn render_composer(
                 };
                 crate::icons::draw(ui.painter(), "send", s_rect.center(), 19.0, sc);
                 if send_resp.clicked() && can_send {
-                    send_current(ui, rest.clone(), chat_state, cid);
+                    send_current(sender, chat_state, cid);
                 }
 
-                // Enter to send (singleline TextEdit: Enter = focus loss).
-                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                let enter_down = ui.input(|i| i.key_pressed(Key::Enter));
-                if (enter_pressed || (response.has_focus() && enter_down)) && can_send {
-                    send_current(ui, rest, chat_state, cid);
-                    response.request_focus();
+                // Enter-to-send, with exactly-once semantics.
+                //
+                // The singleline TextEdit reacts to Enter by surrendering
+                // keyboard focus (in this same frame) but it does NOT consume
+                // the key event, so any other Enter check in the same frame
+                // can see the same press. `consume_key` removes the event
+                // from the input state, which guarantees that one physical
+                // Enter can trigger at most one send - ever. The composer
+                // must own focus (or have just lost it to this very press) so
+                // Enter presses aimed at other widgets (search box, modal)
+                // never send messages.
+                let composer_focused = response.has_focus() || response.lost_focus();
+                if composer_focused {
+                    let enter = ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, Key::Enter)
+                    });
+                    if enter {
+                        chat_state.send_error = None;
+                        if can_send {
+                            send_current(sender, chat_state, cid);
+                        }
+                        // Discord keeps the composer focused after sending.
+                        response.request_focus();
+                    }
+                }
+                // Any edit to the input dismisses a stale send error.
+                if response.changed() {
+                    chat_state.send_error = None;
                 }
             });
         });
@@ -773,8 +967,7 @@ fn render_composer(
 }
 
 fn send_current(
-    _ui: &mut Ui,
-    rest: Arc<crate::rest::Http>,
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
     chat_state: &mut ChatState,
     cid: Option<Snowflake>,
 ) {
@@ -784,9 +977,40 @@ fn send_current(
         return;
     }
     let reply_to = chat_state.reply_to.take();
+
+    // Idempotency nonce: sent with the REST call and echoed back in the
+    // MESSAGE_CREATE gateway event. Locally we insert an optimistic copy
+    // keyed by the nonce; the first delivery (REST response or gateway
+    // event) replaces it, so the user sees the message exactly once and
+    // never double-sends. See state::AppState::insert_pending_message.
+    let nonce = crate::state::new_nonce();
+    let nonce_str = nonce.0.to_string();
+
+    // Optimistic echo: the author's own message appears in the history
+    // immediately, before the network round-trip.
+    if let Some(s) = crate::state::global() {
+        let author = s.current_user().unwrap_or_default();
+        s.insert_pending_message(
+            cid,
+            &crate::model::Message {
+                id: nonce,
+                channel_id: cid,
+                author,
+                content: content.clone(),
+                nonce: Some(nonce_str.clone()),
+                message_reference: reply_to.map(|id| crate::model::MessageReference {
+                    message_id: Some(id),
+                    channel_id: Some(cid),
+                    guild_id: None,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
     let body = CreateMessageBody {
         content: Some(content),
-        nonce: None,
+        nonce: Some(nonce_str.clone()),
         tts: Some(false),
         embeds: Vec::new(),
         attachments: Vec::new(),
@@ -802,11 +1026,10 @@ fn send_current(
         }),
     };
     chat_state.input.clear();
-    tokio::spawn(async move {
-        if let Err(e) = rest.post_message(cid, &body).await {
-            tracing::warn!(error = %e, "send message");
-        }
-    });
+    chat_state.send_error = None;
+    // Hand the message to the single send worker: one queue entry = one
+    // REST POST, in order, never retried (see src/sender.rs).
+    let _ = sender.send((cid, body, nonce_str));
 }
 
 fn humansize(bytes: u64) -> String {
@@ -821,4 +1044,174 @@ fn humansize(bytes: u64) -> String {
         return format!("{v} {}", UNITS[0]);
     }
     format!("{:.1} {}", v, UNITS[i])
+}
+
+// ───────────────────────────── security tests ─────────────────────────────
+//
+// The double-send bug: one Enter produced two REST POSTs. Root cause was
+// the composer's Enter handling reading the same raw key event through
+// two overlapping clauses (`lost_focus && key_pressed` OR
+// `has_focus && key_pressed`) while immediately re-requesting focus, so
+// the un-consumed event stayed visible to later checks. These tests pin
+// the exactly-once guarantee against the REAL composer code.
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use crate::model::{Channel, ChannelType, Snowflake};
+    use crate::state::AppState;
+
+    fn test_channel() -> Channel {
+        Channel {
+            id: Snowflake(42),
+            kind: ChannelType::Text,
+            name: "general".into(),
+            ..Default::default()
+        }
+    }
+
+    fn enter_event() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }
+    }
+
+    fn run_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        app: &AppState,
+        sender: &tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
+        chat: &mut ChatState,
+    ) {
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            time: Some(1.0),
+            ..Default::default()
+        };
+        let ch = test_channel();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        let output = ctx.run_ui(input, |ui| {
+            ui.set_min_size(egui::vec2(900.0, 700.0));
+            super::render_composer(ui, app, sender, chat, Some(&ch));
+        });
+        // Like egui's own __run_test_ui: discard textures without applying.
+        output.drop_without_applying_deltas();
+    }
+
+    fn drain(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::sender::SendRequest>,
+    ) -> Vec<crate::sender::SendRequest> {
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            out.push(r);
+        }
+        out
+    }
+
+    /// ONE Enter press with the composer focused must enqueue EXACTLY ONE
+    /// send. Frames: focus first, then the Enter event, then two idle
+    /// frames (a same-frame second check or a cross-frame re-read of the
+    /// event would fire a second send - this is the regression test for
+    /// the bug that duplicated messages).
+    #[test]
+    fn single_enter_sends_exactly_once() {
+        let ctx = egui::Context::default();
+        let app = AppState::new();
+        let (tx, mut rx) = crate::sender::channel();
+        let mut chat = ChatState {
+            input: "hello world".into(),
+            want_composer_focus: true,
+            ..Default::default()
+        };
+
+        // Frame 1: focus the composer (want_composer_focus path).
+        run_frame(&ctx, Vec::new(), &app, &tx, &mut chat);
+        assert!(drain(&mut rx).is_empty(), "no send before Enter");
+
+        // Frame 2: the single Enter press.
+        run_frame(&ctx, vec![enter_event()], &app, &tx, &mut chat);
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1, "one Enter must enqueue exactly one send");
+        assert_eq!(sent[0].1.content.as_deref(), Some("hello world"));
+        assert!(!sent[0].2.is_empty(), "send carries a nonce");
+        assert!(chat.input.is_empty(), "input clears after send");
+
+        // Frames 3 and 4: idle. The old bug could re-fire here because the
+        // Enter event stayed visible while focus churned.
+        run_frame(&ctx, Vec::new(), &app, &tx, &mut chat);
+        run_frame(&ctx, Vec::new(), &app, &tx, &mut chat);
+        assert!(drain(&mut rx).is_empty(), "no extra sends after idle frames");
+    }
+
+    /// Enter with focus somewhere else must NOT send (the DM search box
+    /// must be able to receive Enter without the chat composer firing).
+    #[test]
+    fn enter_without_composer_focus_does_not_send() {
+        let ctx = egui::Context::default();
+        let app = AppState::new();
+        let (tx, mut rx) = crate::sender::channel();
+        let mut chat = ChatState {
+            input: "hello world".into(),
+            want_composer_focus: false,
+            ..Default::default()
+        };
+
+        // Frame 1: no focus interaction.
+        run_frame(&ctx, Vec::new(), &app, &tx, &mut chat);
+        // Frame 2: Enter while the composer never held focus.
+        run_frame(&ctx, vec![enter_event()], &app, &tx, &mut chat);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "Enter outside the composer must not send"
+        );
+        assert_eq!(chat.input, "hello world", "input is preserved");
+    }
+
+    /// Two separate Enter presses = two sends (fast consecutive messages
+    /// are legitimate; only DUPLICATES of one press are the bug).
+    #[test]
+    fn two_enters_send_twice() {
+        let ctx = egui::Context::default();
+        let app = AppState::new();
+        let (tx, mut rx) = crate::sender::channel();
+        let mut chat = ChatState {
+            input: "first".into(),
+            want_composer_focus: true,
+            ..Default::default()
+        };
+        run_frame(&ctx, Vec::new(), &app, &tx, &mut chat);
+        run_frame(&ctx, vec![enter_event()], &app, &tx, &mut chat);
+        chat.input = "second".into();
+        run_frame(&ctx, vec![enter_event()], &app, &tx, &mut chat);
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 2, "two presses, two sends");
+        assert_eq!(sent[0].1.content.as_deref(), Some("first"));
+        assert_eq!(sent[1].1.content.as_deref(), Some("second"));
+        // Nonces must differ (idempotency keys are per-message).
+        assert_ne!(sent[0].2, sent[1].2);
+    }
+
+    /// Enter on an empty composer sends nothing and does not lose the draft.
+    #[test]
+    fn enter_with_empty_input_sends_nothing() {
+        let ctx = egui::Context::default();
+        let app = AppState::new();
+        let (tx, mut rx) = crate::sender::channel();
+        let mut chat = ChatState {
+            input: "   ".into(), // whitespace-only trims to empty
+            want_composer_focus: true,
+            ..Default::default()
+        };
+        run_frame(&ctx, Vec::new(), &app, &tx, &mut chat);
+        run_frame(&ctx, vec![enter_event()], &app, &tx, &mut chat);
+        assert!(drain(&mut rx).is_empty());
+    }
 }

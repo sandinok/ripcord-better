@@ -152,6 +152,13 @@ impl Guild {
         Some(format!("https://cdn.discordapp.com/icons/{}/{}.{}?size=128", self.id, h, ext))
     }
 
+    /// Guild banner (wide strip) for the top of the channel sidebar, as the
+    /// official client shows it.
+    pub fn banner_url(&self) -> Option<String> {
+        let h = self.banner.as_ref()?;
+        Some(format!("https://cdn.discordapp.com/banners/{}/{}.png?size=600", self.id, h))
+    }
+
     pub fn initials(&self) -> String {
         let name = self.name.trim();
         if name.is_empty() {
@@ -364,11 +371,29 @@ pub struct Message {
     pub message_reference: Option<MessageReference>,
     #[serde(default)]
     pub referenced_message: Option<Box<Message>>,
-    #[serde(default)]
+    /// Client nonce echoed back on MESSAGE_CREATE. Discord sends this as
+    /// either a string OR a raw integer depending on the sender's client,
+    /// so the deserializer accepts both (a numeric nonce from the official
+    /// client used to fail the whole Message parse and drop the message).
+    #[serde(default, deserialize_with = "deserialize_nonce")]
     pub nonce: Option<String>,
     /// Components (buttons / selects) — only render text in v0.
     #[serde(default)]
     pub components: Vec<serde_json::Value>,
+}
+
+/// `nonce` arrives as a JSON string or integer; normalize to String.
+fn deserialize_nonce<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        Some(Value::String(s)) => Some(s),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 impl Message {
@@ -621,6 +646,8 @@ pub struct EmbedFooter {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmbedImage {
     pub url: String,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
     #[serde(default)]
     pub width: Option<u32>,
     #[serde(default)]

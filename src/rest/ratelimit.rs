@@ -48,7 +48,7 @@ impl RateLimiter {
     /// Returns a fresh attempt counter for the request. If the route's
     /// bucket has 0 remaining tokens and the reset is in the future, this
     /// function sleeps until reset+1ms.
-    pub async fn acquire(&self, route: &Route) -> Result<u8, super::HttpError> {
+    pub async fn acquire(&self, route: &Route) -> Result<(), super::HttpError> {
         let bucket = {
             let mut g = self.buckets.lock();
             g.entry(route.clone())
@@ -77,7 +77,7 @@ impl RateLimiter {
         if let Some(d) = wait {
             tokio::time::sleep(d).await;
         }
-        Ok(0)
+        Ok(())
     }
 
     pub fn update_from_headers(&self, route: &Route, bucket_id: String, headers: &HeaderMap) {
@@ -104,5 +104,20 @@ impl RateLimiter {
                 st.reset_at = Some(Instant::now() + Duration::from_secs_f64(secs));
             }
         }
+    }
+
+    /// Mark a bucket as exhausted for the next `window` (used when Discord
+    /// answers 429 so queued requests on the same route wait it out instead
+    /// of stacking more 429s).
+    pub fn mark_exhausted(&self, route: &Route, window: Duration) {
+        let bucket = {
+            let mut g = self.buckets.lock();
+            g.entry(route.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(BucketState::default())))
+                .clone()
+        };
+        let mut st = bucket.lock();
+        st.remaining = 0;
+        st.reset_at = Some(Instant::now() + window + Duration::from_millis(50));
     }
 }

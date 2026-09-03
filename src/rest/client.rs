@@ -27,7 +27,7 @@ pub enum HttpError {
     Discord(StatusCode, String),
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
-    #[error("rate-limited after retries: bucket={0}")]
+    #[error("rate-limited by Discord (bucket={0}). The request was NOT resent.")]
     RateLimited(String),
     #[error("decode json: {0}")]
     Decode(#[from] serde_json::Error),
@@ -54,10 +54,12 @@ pub struct Http {
 impl Http {
     pub fn new(token: Option<String>) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        // User-Agent is REQUIRED — Cloudflare will 403 on default reqwest UA.
-        // Format mandated by https://discord.com/developers/docs/reference#user-agent
-        let ua = "Basalt (https://github.com/sandinok/basalt, 0.1.0)";
-        headers.insert(USER_AGENT, HeaderValue::from_static(ua));
+        // A User-Agent is REQUIRED on every request — Cloudflare 403s the
+        // default reqwest UA. The actual UA is chosen per request (see
+        // `ua_for_request`) so the REST identity always matches the gateway
+        // IDENTIFY properties: web-client UA for user sessions, the
+        // documented bot format once the token turns out to be a bot.
+        headers.insert(USER_AGENT, HeaderValue::from_static(crate::identity::PLACEHOLDER_UA));
         headers.insert(
             HeaderName::from_static("accept"),
             HeaderValue::from_static("application/json"),
@@ -197,7 +199,7 @@ impl Http {
         path: &str,
     ) -> Result<T, HttpError> {
         let url = format!("{}{}", API_BASE, path);
-        let attempt = self.acquire_attempt(&route).await?;
+        self.acquire_attempt(&route).await?;
         // Snapshot the token into an owned `Option<String>` so the
         // `RwLockReadGuard` is dropped *before* the `.send().await`. The guard
         // contains a `*mut ()` (parking_lot), so holding it across an await
@@ -211,7 +213,7 @@ impl Http {
             .send()
             .await
             .map_err(HttpError::Network)?;
-        let resp = self.handle_response(route, resp, attempt).await?;
+        let resp = self.handle_response(route, resp).await?;
         resp.json::<T>().await.map_err(HttpError::Network)
     }
 
@@ -222,7 +224,7 @@ impl Http {
         body: &B,
     ) -> Result<T, HttpError> {
         let url = format!("{}{}", API_BASE, path);
-        let attempt = self.acquire_attempt(&route).await?;
+        self.acquire_attempt(&route).await?;
         let body = serde_json::to_vec(body).map_err(HttpError::Decode)?;
         // See `get_json_with_path` for why we snapshot the token here.
         let token_owned = self.token.read().clone();
@@ -235,7 +237,7 @@ impl Http {
             .send()
             .await
             .map_err(HttpError::Network)?;
-        let resp = self.handle_response(route, resp, attempt).await?;
+        let resp = self.handle_response(route, resp).await?;
         resp.json::<T>().await.map_err(HttpError::Network)
     }
 
@@ -247,7 +249,7 @@ impl Http {
         path: &str,
     ) -> Result<serde_json::Value, HttpError> {
         let url = format!("{}{}", API_BASE, path);
-        let attempt = self.acquire_attempt(&route).await?;
+        self.acquire_attempt(&route).await?;
         // See `get_json_with_path` for why we snapshot the token here.
         let token_owned = self.token.read().clone();
         let bot_prefix = *self.bot_prefix.read();
@@ -258,7 +260,7 @@ impl Http {
             .send()
             .await
             .map_err(HttpError::Network)?;
-        let resp = self.handle_response(route, resp, attempt).await?;
+        let resp = self.handle_response(route, resp).await?;
         // Empty bodies come back as 204 No Content — return an empty JSON object.
         let txt = resp.text().await.map_err(HttpError::Network)?;
         if txt.is_empty() {
@@ -268,7 +270,7 @@ impl Http {
         }
     }
 
-    async fn acquire_attempt(&self, route: &Route) -> Result<u8, HttpError> {
+    async fn acquire_attempt(&self, route: &Route) -> Result<(), HttpError> {
         // Wait on global pause if active.
         loop {
             let mut gp = self.global_pause.lock().await;
@@ -282,12 +284,7 @@ impl Http {
         self.limiter.acquire(route).await
     }
 
-    async fn handle_response(
-        &self,
-        route: Route,
-        resp: Response,
-        attempt: u8,
-    ) -> Result<Response, HttpError> {
+    async fn handle_response(&self, route: Route, resp: Response) -> Result<Response, HttpError> {
         let status = resp.status();
         let bucket = resp
             .headers()
@@ -298,32 +295,36 @@ impl Http {
             // Update remaining / reset-after for this bucket.
             self.limiter.update_from_headers(&route, b.clone(), resp.headers());
         }
-        // 429 → backoff and retry.
+        // 429 → wait the full Retry-After (strictly, per Discord's docs),
+        // then report the failure to the caller. Requests are NEVER resent
+        // automatically: a resend after an ambiguous failure is exactly how
+        // duplicate messages and spam strikes happen. The error carries the
+        // bucket; the UI shows it to the user.
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_ms = parse_retry_after(resp.headers()).unwrap_or(1000);
-            let is_global = resp
-                .headers()
-                .get("X-RateLimit-Global")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            let body = resp.text().await.unwrap_or_default();
+            // Read headers before `text()` consumes the response.
+            let (retry_after_ms, is_global) = {
+                let hdrs = resp.headers().clone();
+                let body = resp.text().await.unwrap_or_default();
+                parse_429(&body, &hdrs)
+            };
             tracing::warn!(
                 bucket = ?bucket, retry_ms = retry_after_ms, global = is_global,
                 "discord 429"
             );
             if is_global {
-                // Set the global pause so all in-flight requests await it.
-                let dur = Duration::from_millis(retry_after_ms.max(1));
+                // A global rate-limit blocks *all* routes: park a shared
+                // sleep so in-flight and future requests wait it out.
+                let dur = Duration::from_millis(retry_after_ms + 250);
                 let mut gp = self.global_pause.lock().await;
                 *gp = Some(Box::pin(tokio::time::sleep(dur)));
-            } else if attempt < 3 {
-                tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
-                // Re-acquire for the retry.
-                self.acquire_attempt(&route).await?;
-                return Err(HttpError::RateLimited(bucket.unwrap_or_default()));
+            } else {
+                // Bucket-level: mark the bucket exhausted for the full
+                // window so queued requests wait instead of piling 429s,
+                // then sleep this caller out too.
+                self.limiter.mark_exhausted(&route, Duration::from_millis(retry_after_ms));
+                tokio::time::sleep(Duration::from_millis(retry_after_ms + 50)).await;
             }
-            return Err(HttpError::Discord(status, body));
+            return Err(HttpError::RateLimited(bucket.unwrap_or_default()));
         }
         if status.is_success() {
             return Ok(resp);
@@ -335,20 +336,31 @@ impl Http {
     }
 }
 
-fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
-    // Try X-RateLimit-Reset-After first (seconds, float) — preferred, more accurate than Retry-After (seconds).
-    if let Some(v) = headers.get("X-RateLimit-Reset-After").and_then(|v| v.to_str().ok()) {
-        if let Ok(secs) = v.parse::<f64>() {
-            return Some((secs * 1000.0).round() as u64);
+/// Parse a 429 response. Returns (retry_after_ms, is_global).
+///
+/// Discord puts the authoritative `retry_after` (seconds, float) in the JSON
+/// body; the `Retry-After` header is the HTTP-standard fallback (seconds).
+/// `X-RateLimit-Global: true` marks a Cloudflare-level global limit.
+fn parse_429(body: &str, headers: &HeaderMap) -> (u64, bool) {
+    let mut retry_after_ms: Option<u64> = None;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(secs) = v.get("retry_after").and_then(|r| r.as_f64()) {
+            retry_after_ms = Some((secs * 1000.0).ceil() as u64);
         }
     }
-    if let Some(v) = headers.get("Retry-After").and_then(|v| v.to_str().ok()) {
-        // Could be seconds (int) or HTTP date. Try int first.
-        if let Ok(secs) = v.parse::<u64>() {
-            return Some(secs * 1000);
+    if retry_after_ms.is_none() {
+        if let Some(v) = headers.get("Retry-After").and_then(|v| v.to_str().ok()) {
+            if let Ok(secs) = v.parse::<f64>() {
+                retry_after_ms = Some((secs * 1000.0).ceil() as u64);
+            }
         }
     }
-    None
+    let is_global = headers
+        .get("X-RateLimit-Global")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    (retry_after_ms.unwrap_or(1000), is_global)
 }
 
 // ── Helper trait for adding the Authorization header only when we have a token.
@@ -358,6 +370,16 @@ trait RequestBuilderExt {
 
 impl RequestBuilderExt for reqwest::RequestBuilder {
     fn send_opt_auth(mut self, token: Option<&str>, bot_prefix: bool) -> Self {
+        // UA first: user sessions keep the web-client UA; bot sessions use
+        // the documented bot format. Per-request headers override defaults.
+        let ua = if bot_prefix {
+            crate::identity::bot_user_agent()
+        } else {
+            crate::identity::web_user_agent()
+        };
+        if let Ok(v) = HeaderValue::from_str(&ua) {
+            self = self.header(USER_AGENT, v);
+        }
         if let Some(t) = token {
             if !t.is_empty() {
                 let value = if bot_prefix { format!("Bot {t}") } else { t.to_string() };

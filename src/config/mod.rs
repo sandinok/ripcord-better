@@ -45,6 +45,13 @@ pub struct Config {
     /// Prefix the window title with the mention count, like `(3) Basalt`.
     #[serde(default = "default_title_mentions")]
     pub title_mentions: bool,
+
+    /// DM channels discovered in past sessions, by id. Bot accounts get no
+    /// DM list from READY or REST, so the client remembers the DMs it has
+    /// seen (via gateway events) and re-fetches them on startup. User
+    /// accounts get the full list from READY anyway; the cache is harmless.
+    #[serde(default)]
+    pub dm_channel_ids: Vec<String>,
 }
 
 fn default_density() -> String {
@@ -77,6 +84,7 @@ impl Default for Config {
             font_size: default_font_size(),
             show_unread_badges: default_badges(),
             title_mentions: default_title_mentions(),
+            dm_channel_ids: Vec::new(),
         }
     }
 }

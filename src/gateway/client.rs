@@ -97,6 +97,9 @@ impl Gateway {
             let mut token: Option<String> = None;
             let mut is_bot = false;
             let mut shutdown = false;
+            // Reconnect backoff state: exponential with jitter, reset after
+            // a connection survives long enough. See sleep_backoff.
+            let mut backoff: u64 = BASE_BACKOFF_MS;
             // Start with the full intent set (members, presences, message
             // content); if Discord closes with 4014 we retry once with the
             // baseline set so the app still works, just without presence.
@@ -130,6 +133,7 @@ impl Gateway {
                 let Some(token) = token.clone() else { continue; };
 
                 // Run the connection. Returns a status code telling us what to do next.
+                let started = std::time::Instant::now();
                 let outcome = run_connection_loop(
                     token.clone(),
                     is_bot,
@@ -143,10 +147,25 @@ impl Gateway {
                     Ok(ConnOutcome::ReconnectFresh) => {
                         tracing::info!("gateway reconnecting fresh (IDENTIFY)");
                         state.clear_session().await;
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        if started.elapsed() < STABLE_CONN_SECS {
+                            backoff = backoff.saturating_mul(2).min(MAX_BACKOFF_MS);
+                        } else {
+                            backoff = BASE_BACKOFF_MS;
+                        }
+                        sleep_backoff(backoff).await;
                     }
                     Ok(ConnOutcome::ReconnectResume) => {
                         tracing::info!("gateway reconnecting (RESUME)");
+                        // RESUME right after a drop is expected behavior; only
+                        // repeated fast churn backs off.
+                        if started.elapsed() < STABLE_CONN_SECS {
+                            backoff = backoff.max(BASE_BACKOFF_MS).saturating_mul(2).min(MAX_BACKOFF_MS);
+                        } else {
+                            backoff = BASE_BACKOFF_MS;
+                        }
+                        if backoff > BASE_BACKOFF_MS {
+                            sleep_backoff(backoff).await;
+                        }
                     }
                     Err(GatewayError::AuthFailed) => {
                         tracing::error!("auth failed (close code 4004) - token is bad; halting");
@@ -160,6 +179,8 @@ impl Gateway {
                             intent_set = intents::BASELINE;
                             state.set_intents_limited(true);
                             state.clear_session().await;
+                            // Our own one-shot retry, not a server flap: the
+                            // backoff ladder is untouched.
                         } else {
                             tracing::error!("disallowed intent even with baseline set - halting");
                             state.set_connection_status(
@@ -170,13 +191,67 @@ impl Gateway {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "connection loop ended; backing off");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        backoff = if started.elapsed() < STABLE_CONN_SECS {
+                            backoff.max(BASE_BACKOFF_MS).saturating_mul(2).min(MAX_BACKOFF_MS)
+                        } else {
+                            BASE_BACKOFF_MS
+                        };
+                        sleep_backoff(backoff).await;
                     }
                 }
             }
             tracing::info!("gateway task exiting");
         });
     }
+}
+
+/// Base reconnect backoff, milliseconds. Doubles per consecutive failure,
+/// capped at MAX_BACKOFF_MS, reset once a connection survives
+/// STABLE_CONN_SECS.
+const BASE_BACKOFF_MS: u64 = 1_000;
+const MAX_BACKOFF_MS: u64 = 60_000;
+const STABLE_CONN_SECS: Duration = Duration::from_secs(30);
+
+/// Sleep `ms` with full jitter (uniform random in [0.6*ms, 1.3*ms]): clients
+/// that fail together (network blip) must not reconnect as a synchronized
+/// thundering herd.
+async fn sleep_backoff(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    let mut b = [0u8; 8];
+    let _ = getrandom::fill(&mut b);
+    let rand01 = (u64::from_le_bytes(b) % 1_000_000) as f64 / 1_000_000.0;
+    let jittered = (ms as f64 * 0.6) + rand01 * (ms as f64 * 0.7);
+    tokio::time::sleep(Duration::from_millis(jittered.max(50.0) as u64)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn backoff_ladder_doubles_and_caps() {
+        let mut b = super::BASE_BACKOFF_MS;
+        let mut steps = Vec::new();
+        for _ in 0..10 {
+            steps.push(b);
+            b = b.saturating_mul(2).min(super::MAX_BACKOFF_MS);
+        }
+        assert_eq!(steps[0], 1_000);
+        assert_eq!(steps[1], 2_000);
+        assert_eq!(steps[5], 32_000);
+        assert!(steps.iter().all(|&s| s <= super::MAX_BACKOFF_MS));
+        assert_eq!(steps[9], super::MAX_BACKOFF_MS);
+    }
+}
+
+
+/// `Origin: https://discord.com` for the WS handshake (browsers always
+/// send it; its absence reads as a non-browser client).
+fn http_origin() -> tokio_tungstenite::tungstenite::http::HeaderValue {
+    tokio_tungstenite::tungstenite::http::HeaderValue::from_static("https://discord.com")
+}
+fn http_ua(ua: &str) -> std::result::Result<tokio_tungstenite::tungstenite::http::HeaderValue, tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue> {
+    tokio_tungstenite::tungstenite::http::HeaderValue::from_str(ua)
 }
 
 enum ConnOutcome {
@@ -196,7 +271,28 @@ async fn run_connection_loop(
     state.set_connection_status(crate::state::ConnectionStatus::Connecting).await;
     tracing::info!(url = GATEWAY_URL, "connecting to gateway");
 
-    let (ws, _) = tokio_tungstenite::connect_async(GATEWAY_URL).await?;
+    // Browser-shaped handshake: a real browser always sends `Origin` on a
+    // websocket upgrade, and the UA must match the one the REST layer uses
+    // (and the one claimed in IDENTIFY properties) or the session reads as
+    // an inconsistent client to risk systems.
+    let ua = if is_bot {
+        crate::identity::bot_user_agent()
+    } else {
+        crate::identity::web_user_agent()
+    };
+    // `into_client_request` fills in the required handshake headers
+    // (Host, Connection, Upgrade, Sec-WebSocket-Key, Sec-WebSocket-Version);
+    // a hand-built Request without them is rejected by the server.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = GATEWAY_URL
+        .into_client_request()
+        .map_err(|e| anyhow!("gateway request build: {e}"))?;
+    let headers = request.headers_mut();
+    headers.insert("Origin", http_origin());
+    if let Ok(v) = http_ua(&ua) {
+        headers.insert("User-Agent", v);
+    }
+    let (ws, _) = tokio_tungstenite::connect_async(request).await?;
     let (mut sink, mut stream) = ws.split();
     let mut zlib = GatewayZlib::new();
     use futures_util::{SinkExt, StreamExt};
@@ -224,18 +320,17 @@ async fn run_connection_loop(
         _ => {
             // Bot accounts reject the user-client fields (capabilities,
             // client_state, rich properties) with an invalid-session close,
-            // so they get the minimal payload everyone accepts.
+            // so they get the minimal payload everyone accepts. User
+            // sessions get the full web-client shape with properties that
+            // match the OS, the User-Agent and the browser we claim
+            // elsewhere (see src/identity.rs).
             let identify = if is_bot {
                 serde_json::json!({
                     "op": GatewayOp::Identify as u8,
                     "d": {
                         "token": token,
                         "intents": intent_set,
-                        "properties": {
-                            "os": std::env::consts::OS,
-                            "browser": "Basalt",
-                            "device": "Basalt",
-                        },
+                        "properties": crate::identity::bot_identify_properties(),
                     }
                 })
             } else {
@@ -244,7 +339,7 @@ async fn run_connection_loop(
                     "d": {
                         "token": token,
                         "capabilities": CLIENT_CAPABILITIES,
-                        "properties": super::opcodes::client_properties(),
+                        "properties": crate::identity::web_identify_properties(),
                         "presence": {
                             "status": state.own_status(),
                             "since": 0,

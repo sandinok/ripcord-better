@@ -294,6 +294,58 @@ pub fn render_emoji(ui: &mut Ui, url: &str, size: f32, name: &str) {
 /// Render an inline Twemoji at `size` px. Tries `url`, then `fallback_url`,
 /// then gives up and renders the raw emoji cluster as text (monochrome
 /// fallback - better than a hole in the message).
+/// Draw an image so it COVERS `rect` (aspect-fill, center crop) like a
+/// CSS `background-size: cover`. Used for guild banners. Falls back to a
+/// flat fill while loading.
+pub fn draw_cover_image(ui: &mut Ui, rect: Rect, url: &str, max_w: u32, max_h: u32) {
+    let cache = global_cache();
+    let ctx = ui.ctx().clone();
+    if let Some(handle) = cache.get_or_fetch(&ctx, url, max_w, max_h, Shape::Square) {
+        let (tw, th) = (handle.size_vec2().x.max(1.0), handle.size_vec2().y.max(1.0));
+        let target_ar = rect.width() / rect.height().max(1.0);
+        let src_ar = tw / th;
+        let uv = if src_ar > target_ar {
+            // Source wider: crop the sides.
+            let keep = target_ar / src_ar;
+            let cut = (1.0 - keep) / 2.0;
+            Rect::from_min_max(Pos2::new(cut, 0.0), Pos2::new(1.0 - cut, 1.0))
+        } else {
+            // Source taller: crop top/bottom.
+            let keep = src_ar / target_ar;
+            let cut = (1.0 - keep) / 2.0;
+            Rect::from_min_max(Pos2::new(0.0, cut), Pos2::new(1.0, 1.0 - cut))
+        };
+        ui.painter_at(rect).image(handle.id(), rect, uv, egui::Color32::WHITE);
+    } else {
+        // Loading: flat sidebar-tinted placeholder so the layout is stable.
+        ui.painter_at(rect).rect_filled(rect, 0.0, egui::Color32::from_rgb(0x1E, 0x1F, 0x22));
+    }
+}
+
+/// Draw an emoji cluster at an explicit rect (picker grids and other manual
+/// layouts). Same cache/fallback chain as `render_emoji_inline`, but the
+/// caller controls placement.
+pub fn draw_emoji_at(ui: &mut Ui, rect: egui::Rect, url: &str, fallback_url: &str, cluster: &str) {
+    let cache = global_cache();
+    let ctx = ui.ctx().clone();
+    let px = rect.width().max(8.0) as u32;
+    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+    if let Some(handle) = cache.get_or_fetch(&ctx, url, px, px, Shape::Square) {
+        ui.painter_at(rect).image(handle.id(), rect, uv, egui::Color32::WHITE);
+        return;
+    }
+    if let Some(handle) = cache.get_or_fetch(&ctx, fallback_url, px, px, Shape::Square) {
+        ui.painter_at(rect).image(handle.id(), rect, uv, egui::Color32::WHITE);
+        return;
+    }
+    let galley = ui.painter().layout_no_wrap(
+        cluster.to_string(),
+        egui::FontId::proportional(rect.width() * 0.8),
+        egui::Color32::from_rgb(0xB5, 0xBA, 0xC1),
+    );
+    ui.painter_at(rect).galley(rect.min, galley, egui::Color32::WHITE);
+}
+
 pub fn render_emoji_inline(ui: &mut Ui, url: &str, fallback_url: &str, size: f32, cluster: &str) {
     let cache = global_cache();
     let ctx = ui.ctx().clone();

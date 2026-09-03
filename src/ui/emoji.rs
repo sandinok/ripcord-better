@@ -197,6 +197,12 @@ pub fn render_with_emojis(
     }
 }
 
+/// Draw an emoji cluster at an explicit rect (manual layouts such as the
+/// reaction picker grid).
+pub fn draw_emoji_at(ui: &mut Ui, rect: egui::Rect, cluster: &str) {
+    image_loader::draw_emoji_at(ui, rect, &twemoji_url(cluster), &twemoji_url_vs16(cluster), cluster);
+}
+
 /// Render an emoji cluster as an image at `size` px (no text fallback mix).
 pub fn render_emoji_image(ui: &mut Ui, cluster: &str, size: f32) {
     let url = twemoji_url(cluster);

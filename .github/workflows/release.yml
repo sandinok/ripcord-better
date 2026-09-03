@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to attach binaries to (e.g. v0.1.0)"
+        description: "Release tag to attach binaries to (e.g. v0.1.1)"
         required: true
         type: string
   push:
@@ -56,9 +56,10 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Test (native)
-        if: matrix.os != 'windows-latest' || matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo test --release
 
+      # ── Windows: single .exe (icon embedded at build time via build.rs +
+      # winresource, so Explorer and the taskbar show the Basalt mark) ──
       - name: Package (zip)
         if: matrix.name == 'windows-x86_64'
         shell: pwsh
@@ -67,8 +68,44 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/"
           Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.archive }}" -Force
 
+      # ── macOS: real .app bundle with Info.plist + icns, so Finder and the
+      # Dock show the icon and Launchpad lists the app ──
+      - name: Package (.app bundle)
+        if: matrix.name == 'macos-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="dist/Basalt.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$APP/Contents/MacOS/Basalt"
+          cp assets/icon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Basalt</string>
+            <key>CFBundleDisplayName</key><string>Basalt</string>
+            <key>CFBundleExecutable</key><string>Basalt</string>
+            <key>CFBundleIdentifier</key><string>com.sandinok.basalt</string>
+            <key>CFBundleVersion</key><string>0.1.1</string>
+            <key>CFBundleShortVersionString</key><string>0.1.1</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # Sign ad-hoc so macOS Gatekeeper treats it as a locally-built app
+          # instead of "unidentified developer" (no distribution cert yet).
+          codesign --force --deep --sign - "$APP" || true
+          (cd dist && tar czf "${{ matrix.archive }}" "Basalt.app")
+
+      # ── Linux: plain binary ──
       - name: Package (tar.gz)
-        if: matrix.name != 'windows-x86_64'
+        if: matrix.name == 'linux-x86_64'
         shell: bash
         run: |
           mkdir -p dist

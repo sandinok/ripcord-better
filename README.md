@@ -11,6 +11,8 @@ Basalt is named after the rock: dark, dense, and made of columns.
 ## What works
 
 - Sign in with a bot token (user tokens also work, see the disclaimer below)
+- One Enter = exactly one message: sends are queued through a single
+  worker, deduplicated by nonce, and never retried automatically
 - Server list with real icons, hover morphing, and the white selection pill
 - Channel tree with categories, emoji-colored channel names, unread badges
 - Chat with markdown, code blocks, mentions, links, spoilers, and embeds

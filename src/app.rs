@@ -29,6 +29,9 @@ pub struct BasaltApp {
     pub config: Config,
     pub shared: Arc<AppState>,
     pub rest: Arc<Http>,
+    /// Single send queue: the composer pushes, one worker POSTs (see
+    /// src/sender.rs). One Enter = exactly one message, ever.
+    pub send_queue: tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
     pub gateway_tx: tokio::sync::mpsc::UnboundedSender<Outbound>,
     pub _gateway_task: Option<Arc<Gateway>>,
     pub event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::gateway::events::Event>,
@@ -71,6 +74,12 @@ impl BasaltApp {
             let rest_clone = rest.clone();
             let shared_clone = shared.clone();
             let gateway_tx_clone = gateway_tx.clone();
+            let dm_seed: Vec<u64> = config
+                .dm_channel_ids
+                .iter()
+                .filter_map(|id| id.parse().ok())
+                .collect();
+            let mut dm_seed_alive = dm_seed.clone();
             runtime_handle.spawn(async move {
                 // Probe the token type first (raw user-token auth vs the
                 // Bot prefix) so the gateway gets the right IDENTIFY shape.
@@ -116,11 +125,35 @@ impl BasaltApp {
                         tracing::error!(error = %e, "REST get dm channels failed");
                     }
                 }
+                // Seed DMs remembered from past sessions: bot accounts have
+                // no other way to recover their DM list after a restart.
+                for id in dm_seed.clone() {
+                    match rest_clone.get_channel(crate::model::Snowflake(id)).await {
+                        Ok(c) => {
+                            let mut ch = shared_clone.channels.write();
+                            if !ch.iter().any(|x| x.id == c.id) {
+                                ch.push(c);
+                            }
+                        }
+                        Err(_) => {
+                            // Closed or deleted DM: drop it from the seed.
+                            dm_seed_alive.retain(|&v| v != id);
+                        }
+                    }
+                }
             });
         }
 
+        let (send_tx, send_rx) = crate::sender::channel();
+        let rest_worker = rest.clone();
+        runtime_handle.spawn(async move {
+            // The worker owns the receiving half for the whole session.
+            crate::sender::spawn_worker(rest_worker, send_rx);
+        });
+
         let last_legacy_dots = config.use_legacy_status_dots;
         Self {
+            send_queue: send_tx,
             config,
             shared,
             rest,
@@ -183,6 +216,8 @@ impl BasaltApp {
         self.shared.guilds.write().clear();
         self.shared.channels.write().clear();
         self.chat = ChatState::default();
+        self.config.dm_channel_ids.clear();
+        let _ = self.config.save();
         // Restart the gateway task so a future sign-in can connect.
         let gateway = Arc::new(Gateway::new(self.shared.clone()));
         self.gateway_tx = gateway.sender();
@@ -196,13 +231,30 @@ impl BasaltApp {
     /// gateway and requests repaints when something happened.
     fn pump_events(&mut self, ctx: &egui::Context) {
         let mut got_any = false;
+        let mut new_dm: Option<u64> = None;
         while let Ok(event) = self.event_rx.try_recv() {
             got_any = true;
-            if let crate::gateway::events::Event::PresenceRequested { status } = event {
-                let _ = self
-                    .gateway_tx
-                    .send(crate::gateway::Outbound::SetPresence { status, afk: false });
+            match event {
+                crate::gateway::events::Event::PresenceRequested { status } => {
+                    let _ = self
+                        .gateway_tx
+                        .send(crate::gateway::Outbound::SetPresence { status, afk: false });
+                }
+                // Remember newly seen DM channels so the list survives
+                // restarts (bots get no DM list from the API).
+                crate::gateway::events::Event::MessageCreate { d } => {
+                    let cid_str = d.channel_id.0.to_string();
+                    if d.guild_id.is_none() && !self.config.dm_channel_ids.contains(&cid_str) {
+                        self.config.dm_channel_ids.push(cid_str);
+                        new_dm = Some(d.channel_id.0);
+                    }
+                }
+                _ => {}
             }
+        }
+        if let Some(id) = new_dm {
+            let _ = self.config.save();
+            let _ = id;
         }
         if got_any {
             ctx.request_repaint();
@@ -285,8 +337,10 @@ impl eframe::App for BasaltApp {
                 .inner;
             if let Some(sel) = new_sel {
                 self.shared.set_selection_sync(sel);
-                // Discord also auto-selects the first channel of the guild
-                // (runs each frame via the sidebar until channels arrive).
+                // Keyboard focus follows the conversation: Discord keeps
+                // the composer focused after picking a server/channel, so
+                // typing right after a click goes into the message box.
+                self.chat.want_composer_focus = true;
             }
         }
 
@@ -311,6 +365,10 @@ impl eframe::App for BasaltApp {
                     .map(|cid| !self.shared.is_fetched(cid))
                     .unwrap_or(false);
                 self.shared.set_selection_sync(new_sel.clone());
+                // Keep the composer focused after a channel switch (Discord
+                // behavior); without this the click leaves keyboard focus
+                // on the row and typed messages go nowhere.
+                self.chat.want_composer_focus = true;
                 if needs_fetch {
                     if let Some(cid) = new_sel.channel_id {
                         crate::ui::sidebar::fetch_channel_messages(&self.rest, &self.shared, cid);
@@ -324,6 +382,7 @@ impl eframe::App for BasaltApp {
         {
             let shared = self.shared.clone();
             let rest = self.rest.clone();
+            let sender = self.send_queue.clone();
             let chat = &mut self.chat;
             let config = &mut self.config;
             let login = &mut self.login;
@@ -332,7 +391,7 @@ impl eframe::App for BasaltApp {
                 .frame(egui::Frame::new().fill(colors::BG_CHAT).inner_margin(egui::Margin::same(0)))
                 .show(ui, |ui| {
                     if shared.current_user().is_some() {
-                        crate::ui::chat::render(ui, &shared, rest, chat, config);
+                        crate::ui::chat::render(ui, &shared, rest, &sender, chat, config);
                     } else {
                         let just_signed_in = crate::ui::login::render(ui, login, config);
                         if just_signed_in {
@@ -348,7 +407,10 @@ impl eframe::App for BasaltApp {
         }
 
         // ── Settings modal (overlay, above everything) ──
-        if self.shared.settings_open() {
+        // Only fire the open() transition (which resets the slide-in
+        // animation) on the closed→open edge; calling it every frame used to
+        // reset the animation each frame and fight the close handler.
+        if self.shared.settings_open() && !self.settings.open {
             self.settings.open();
         }
         let mut sign_out_requested = false;

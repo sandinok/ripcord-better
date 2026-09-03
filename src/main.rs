@@ -27,11 +27,13 @@ mod colors;
 mod config;
 mod gateway;
 mod icons;
+mod identity;
 mod icons_data;
 mod image_loader;
 mod markdown;
 mod model;
 mod rest;
+mod sender;
 mod state;
 mod ui;
 

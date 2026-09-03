@@ -86,14 +86,20 @@ pub fn render(
     // Backdrop click (outside the card) closes. NOTE: we deliberately do
     // NOT register a full-screen interact widget - it would swallow every
     // click inside the card. Instead we read the raw pointer state.
-    let backdrop_clicked = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
-        && ui
-            .input(|i| i.pointer.interact_pos())
-            .map(|pos| !card_rect.contains(pos))
-            .unwrap_or(false);
-    if backdrop_clicked {
-        settings.open = false;
-        shared.set_settings_open(false);
+    // Guard: ignore clicks while the entrance animation is still warming up.
+    // The very click that opens the modal is still "button_clicked" in this
+    // frame, and its position (over the gear button, outside the card) would
+    // otherwise close the modal instantly - the flash-open-flash-close bug.
+    if settings.enter > 0.35 {
+        let backdrop_clicked = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
+            && ui
+                .input(|i| i.pointer.interact_pos())
+                .map(|pos| !card_rect.contains(pos))
+                .unwrap_or(false);
+        if backdrop_clicked {
+            settings.open = false;
+            shared.set_settings_open(false);
+        }
     }
     // ESC closes.
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {

@@ -34,7 +34,7 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                 if home_active { 1.0 } else { if home_resp.hovered() { 0.4 } else { 0.0 } },
                 0.15,
             );
-            let radius = lerp(16.0, 24.0, anim_t);
+            let radius = lerp(22.0, 24.0, anim_t);
             let bg = Color32::from_rgba_premultiplied(0x35, 0x39, 0x42, (90.0 + 90.0 * anim_t) as u8);
             ui.painter_at(home_rect).rect_filled(home_rect, radius, bg);
             draw_pill(ui, home_rect, anim_t);
@@ -75,9 +75,10 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                             if is_active { 1.0 } else { if resp.hovered() { 0.4 } else { 0.0 } },
                             0.15,
                         );
-                        // Rest = rounded square (r16), active = circle (r24),
-                        // with a subtle scale-up on hover.
-                        let radius = lerp(16.0, 24.0, anim_t);
+                        // Rest = rounded square (r22, Discord-2024 style),
+                        // hover/active morphs to a full circle, with a subtle
+                        // scale-up on hover.
+                        let radius = lerp(22.0, 24.0, anim_t);
                         let grow = 2.0 * anim_t;
                         let icon_rect = Rect::from_center_size(
                             rect.center(),
@@ -139,7 +140,7 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                     if resp.hovered() { 0.4 } else { 0.0 },
                     0.15,
                 );
-                let radius = lerp(16.0, 24.0, anim_t);
+                let radius = lerp(22.0, 24.0, anim_t);
                 let bg = if anim_t > 0.2 { colors::GREEN } else { colors::GREEN.gamma_multiply(0.75) };
                 ui.painter_at(rect).rect_filled(rect, radius, bg);
                 crate::icons::draw(ui.painter(), "add", rect.center(), 24.0, colors::TEXT_PRIMARY);
@@ -156,7 +157,7 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                     if resp.hovered() { 0.4 } else { 0.0 },
                     0.15,
                 );
-                let radius = lerp(16.0, 24.0, anim_t);
+                let radius = lerp(22.0, 24.0, anim_t);
                 let bg = Color32::from_rgba_premultiplied(0x35, 0x39, 0x42, (90.0 + 90.0 * anim_t) as u8);
                 ui.painter_at(rect).rect_filled(rect, radius, bg);
                 crate::icons::draw(ui.painter(), "settings", rect.center(), 26.0, colors::TEXT_PRIMARY);

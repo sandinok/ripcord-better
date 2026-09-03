@@ -16,6 +16,7 @@ pub mod members;
 pub mod scroll;
 pub mod settings;
 pub mod sidebar;
+pub mod reaction_picker;
 pub mod squircle;
 
 use egui::{Align, Color32, Layout, Sense, Ui};
