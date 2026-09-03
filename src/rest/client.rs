@@ -186,6 +186,12 @@ impl Http {
         Ok(())
     }
 
+    /// Pinned messages of a channel, newest first (Discord's order).
+    pub async fn get_channel_pins(&self, channel_id: Snowflake) -> Result<Vec<crate::model::Message>, HttpError> {
+        let path = format!("/channels/{}/pins", channel_id);
+        self.get_json_with_path(Route::ChannelPins(channel_id), &path).await
+    }
+
     // ── Low-level request helpers ──
 
     async fn get_json<T: DeserializeOwned>(&self, route: Route) -> Result<T, HttpError> {

@@ -3,6 +3,62 @@
 All notable changes to Basalt are documented here. The format follows
 Keep a Changelog 1.1.0.
 
+## 0.1.2 - 2026-09-04
+
+The stability and visuals release. The session never drops, and the chat
+finally looks like Discord.
+
+### Fixed
+
+- "Connection lost - reconnecting" is gone for good. Two causes, both
+  dead: image decoding used to run on the single async worker where a
+  burst of avatars starved the gateway heartbeats (decoding now runs on
+  the blocking pool, and the runtime has two workers), and a missing
+  heartbeat ACK instantly declared the session dead (it now gets a short
+  bounded grace window to arrive first). Verified with a 10-minute soak
+  under continuous scrolling, channel traffic and DM pings: zero drops,
+  zero reconnects.
+- Avatars no longer render as tiny dots. The rounded-corner mask's
+  distance function was wrong (`x.min(r).max(w-r)` collapses to the right
+  edge) and erased everything but a small bottom-right blob; fixed with
+  the proper rounded-rect SDF plus a regression test.
+- Embed thumbnails and link previews load. Every CDN request now carries
+  a User-Agent (Cloudflare 403s UA-less requests - that is why they were
+  gray), thumbnails keep their real aspect ratio, and a fetch can never
+  hang forever (hard timeouts).
+- Custom emojis render as images everywhere, including reactions
+  (straight from the Discord CDN), instead of `:name:` text.
+- Mentions resolve to real names: `@role` uses the role's name and color,
+  `@user` and `#channel` resolve through the live cache instead of raw
+  snowflakes.
+- Default avatars use the numbered CDN path (`embed/avatars/0-5`); the
+  old color-name URLs 404'd.
+- The member list is populated via gateway op 8 (GUILD_MEMBERS_CHUNK,
+  with presences) plus a REST fallback, instead of sitting empty.
+- Embeds use Discord's left color stripe, not a full box border.
+- The ghost gray boxes below the composer are gone: the composer panel
+  now sizes itself from its actual content.
+- Server icons are rounded with a hover morph and the white pill lands on
+  the active server.
+
+### Added
+
+- Header actions: message search (live filter of the loaded history),
+  pinned messages and the unread inbox.
+- Date dividers ("Today", "Yesterday", "long date") between message days.
+- Consecutive messages from the same author group without repeating the
+  avatar; author names use the color of their top role.
+- Click a member or a message author for a profile card: banner, round
+  avatar with status dot, username and roles.
+- RESUME now targets the `resume_gateway_url` Discord hands out in READY.
+
+### Security
+
+- One Enter still sends exactly one message: the exactly-once composer
+  test suite passes unchanged (102 tests total), and the end-to-end
+  check (type + one physical Enter, verify via the API that exactly one
+  message exists) passes against the release binary.
+
 ## 0.1.1 - 2026-09-03
 
 The safety and completeness release. One Enter sends exactly one message,

@@ -10,11 +10,48 @@ use egui::{Key, Rect, Sense, Ui, Vec2};
 
 use crate::colors;
 use crate::image_loader::render_avatar;
-use crate::markdown::{self, NoLookup};
+use crate::markdown::{self, MentionLookup};
 use crate::model::{Channel, Message, Snowflake};
 use crate::rest::endpoints::{AllowedMentions, CreateMessageBody};
 use crate::state::AppState;
 use crate::ui::emoji;
+
+/// Resolves `<@id>` / `<@&id>` / `<#id>` mentions against the live app
+/// state: user names from the user cache, role names + colors from the
+/// current guild, channel names from the channel cache. With NoLookup the
+/// renderer fell back to `@role-853...`-style raw ids.
+struct StateLookup<'a> {
+    state: &'a AppState,
+    guild_id: Option<Snowflake>,
+}
+
+impl MentionLookup for StateLookup<'_> {
+    fn user_label(&self, id: Snowflake) -> String {
+        self.state
+            .user(id)
+            .map(|u| format!("@{}", u.display_name()))
+            .unwrap_or_else(|| "@unknown-user".to_string())
+    }
+    fn role_label(&self, id: Snowflake) -> (String, egui::Color32) {
+        if let Some(g) = self.guild_id.and_then(|g| self.state.guild_by_id(g)) {
+            if let Some(r) = g.roles.iter().find(|r| r.id == id) {
+                let color = if r.color == 0 {
+                    colors::TEXT_SECONDARY
+                } else {
+                    crate::ui::members::role_color(r.color)
+                };
+                return (format!("@{}", r.name), color);
+            }
+        }
+        ("@deleted-role".to_string(), colors::TEXT_SECONDARY)
+    }
+    fn channel_label(&self, id: Snowflake) -> String {
+        self.state
+            .channel_by_id(id)
+            .map(|c| format!("#{}", c.display_name()))
+            .unwrap_or_else(|| "#deleted-channel".to_string())
+    }
+}
 
 pub struct ChatState {
     pub input: String,
@@ -33,6 +70,23 @@ pub struct ChatState {
     /// Last send error, shown inline above the composer until the user
     /// starts typing again. `None` normally; sends never auto-retry.
     pub send_error: Option<String>,
+    /// Top-bar popup that is open: search box, pinned messages, or the
+    /// unread inbox (Discord's three right-side header actions).
+    pub header_popup: HeaderPopup,
+    /// When the header popup was opened (grace window for the opening click).
+    pub header_popup_opened: Option<std::time::Instant>,
+    /// Live query of the search popup.
+    pub search_query: String,
+    /// When the current user card was opened (click on avatar/name).
+    pub card_opened: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderPopup {
+    None,
+    Search,
+    Pins,
+    Inbox,
 }
 
 impl Default for ChatState {
@@ -47,6 +101,10 @@ impl Default for ChatState {
             reaction_search: String::new(),
             reaction_picker_opened: None,
             send_error: None,
+            header_popup: HeaderPopup::None,
+            header_popup_opened: None,
+            search_query: String::new(),
+            card_opened: None,
         }
     }
 }
@@ -73,7 +131,7 @@ pub fn render(
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                render_header(ui, None, config);
+                render_header(ui, None, config, chat_state);
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(colors::BG_CHAT).inner_margin(egui::Margin::same(0)))
@@ -97,12 +155,21 @@ pub fn render(
         .show_separator_line(false)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            render_header(ui, Some(&ch), config);
+            render_header(ui, Some(&ch), config, chat_state);
         });
 
     // ── Composer (bottom panel, ALWAYS visible) ──
+    // The panel height tracks its ACTUAL content: typing line, reply bar,
+    // inline error and the input card. The old fixed 72px overflowed when
+    // reply + typing stacked up, spilling gray placeholder rows below the
+    // composer (the "ghost boxes" row).
     let typing_lines = app_state.typing_in(ch.id).len();
-    let composer_h = 72.0 + if typing_lines > 0 { 20.0 } else { 0.0 } + if chat_state.reply_to.is_some() { 24.0 } else { 0.0 };
+    let composer_h = 44.0 // input card
+        + 10.0 // bottom breathing room
+        + 8.0 // top gap
+        + if typing_lines > 0 { 18.0 } else { 0.0 }
+        + if chat_state.reply_to.is_some() { 22.0 } else { 0.0 }
+        + if chat_state.send_error.is_some() { 18.0 } else { 0.0 };
     egui::Panel::bottom("chat_composer")
         .exact_size(composer_h)
         .frame(egui::Frame::new().fill(colors::BG_CHAT).inner_margin(egui::Margin::same(0)))
@@ -114,24 +181,41 @@ pub fn render(
 
     // ── Message history (fills everything between) ──
     let messages = app_state.messages_for(ch.id);
+    let lookup = StateLookup {
+        state: app_state,
+        guild_id: ch.guild_id,
+    };
     let scroll_output = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(chat_state.auto_scroll)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let mut last_author_id: Option<Snowflake> = None;
+            let mut last_day: Option<time::OffsetDateTime> = None;
             let mut last_author_ts: Option<u64> = None;
             for msg in messages.iter() {
-                let ms_epoch = msg
-                    .timestamp_dt()
+                let dt = msg.timestamp_dt();
+                let ms_epoch = dt
                     .map(|d| (d.unix_timestamp_nanos() / 1_000_000) as u64)
                     .unwrap_or(0);
+                // Date divider between messages from different days, like
+                // the official client ("September 3, 2026" / "Today").
+                let day = dt.map(|d| replace_time(d, 0, 0, 0));
+                if day.is_some() && day != last_day {
+                    if let Some(d) = day {
+                        render_date_divider(ui, d);
+                    }
+                    // A divider breaks author grouping.
+                    last_author_id = None;
+                    last_author_ts = None;
+                }
+                last_day = day;
                 let grouped = last_author_id == Some(msg.author.id)
                     && last_author_ts
                         .map(|t| ms_epoch.saturating_sub(t) < 5 * 60 * 1000)
                         .unwrap_or(false);
                 let compact = config.density == "compact";
-                render_message_row(ui, app_state, msg, grouped, rest.clone(), chat_state, config.font_size, compact);
+                render_message_row(ui, app_state, msg, grouped, rest.clone(), chat_state, config.font_size, compact, &lookup);
                 last_author_id = Some(msg.author.id);
                 last_author_ts = Some(ms_epoch);
             }
@@ -178,11 +262,75 @@ pub fn render(
             }
         }
     }
+
+    // ── User card (opened from a member row or a message author) ──
+    if ui
+        .ctx()
+        .data(|d| d.get_temp::<crate::model::Snowflake>(egui::Id::new(crate::ui::members::CARD_USER_ID)))
+        .is_some()
+    {
+        crate::ui::members::render_user_card(ui, app_state, chat_state.card_opened);
+    } else {
+        chat_state.card_opened = None;
+    }
+
+    // ── Header popups (search / pins / inbox) ──
+    render_header_popup(ui, app_state, chat_state, &ch);
+}
+
+/// Zero out the time-of-day so two timestamps on the same day compare equal.
+fn replace_time(d: time::OffsetDateTime, h: u8, m: u8, s: u8) -> time::OffsetDateTime {
+    d.replace_time(time::Time::from_hms(h, m, s).unwrap_or(time::Time::MIDNIGHT))
+}
+
+/// "Today" / "Yesterday" / "September 3, 2026" separator, Discord-style:
+/// a hairline with the date chip centered on it.
+fn render_date_divider(ui: &mut Ui, day: time::OffsetDateTime) {
+    let today = replace_time(time::OffsetDateTime::now_utc(), 0, 0, 0);
+    let yesterday = today - time::Duration::days(1);
+    let label = if day == today {
+        "Today".to_string()
+    } else if day == yesterday {
+        "Yesterday".to_string()
+    } else {
+        day.format(
+            &time::format_description::parse("[month repr:long] [day], [year]").unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let y = rect.center().y;
+    let inset = 8.0;
+    painter.rect_filled(
+        Rect::from_min_max(egui::pos2(rect.min.x + inset, y - 0.5), egui::pos2(rect.max.x - inset, y + 0.5)),
+        0.0,
+        colors::BG_ACCENT,
+    );
+    let galley = painter.layout(
+        label,
+        egui::FontId::proportional(12.0),
+        colors::TEXT_MUTED,
+        f32::INFINITY,
+    );
+    let chip = Rect::from_center_size(egui::pos2(rect.center().x, y), egui::vec2(galley.size().x + 16.0, 20.0));
+    painter.rect_filled(chip, 3.0, colors::BG_CHAT);
+    painter.galley(
+        egui::pos2(chip.center().x - galley.size().x / 2.0, chip.center().y - galley.size().y / 2.0),
+        galley,
+        egui::Color32::WHITE,
+    );
+    ui.add_space(4.0);
 }
 
 // ───────────────────────────── header ─────────────────────────────
 
-fn render_header(ui: &mut Ui, channel: Option<&Channel>, config: &mut crate::config::Config) {
+fn render_header(
+    ui: &mut Ui,
+    channel: Option<&Channel>,
+    config: &mut crate::config::Config,
+    chat_state: &mut ChatState,
+) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, colors::BG_CHAT);
@@ -240,12 +388,13 @@ fn render_header(ui: &mut Ui, channel: Option<&Channel>, config: &mut crate::con
         colors::BG_ACCENT.gamma_multiply(0.5),
     );
 
-    // Right-side action: toggle the member list (guild channels only).
-    if channel.map(|c| c.guild_id.is_some()).unwrap_or(false) {
-        let m_rect = Rect::from_center_size(
-            egui::pos2(rect.max.x - 28.0, rect.center().y),
-            Vec2::splat(32.0),
-        );
+    // Right-side actions, official order: pins, inbox (bell), search,
+    // members toggle. Each opens its popup below the header.
+    let show_members_action = channel.map(|c| c.guild_id.is_some()).unwrap_or(false);
+    let mut x = rect.max.x - 28.0;
+    let mut popup_just_opened: Option<HeaderPopup> = None;
+    if show_members_action {
+        let m_rect = Rect::from_center_size(egui::pos2(x, rect.center().y), Vec2::splat(32.0));
         let resp = ui
             .interact(m_rect, ui.id().with("chat_toggle_members"), Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -260,6 +409,68 @@ fn render_header(ui: &mut Ui, channel: Option<&Channel>, config: &mut crate::con
             config.show_members = !config.show_members;
             let _ = config.save();
         }
+        x -= 36.0;
+    }
+    // Search.
+    {
+        let r = Rect::from_center_size(egui::pos2(x, rect.center().y), Vec2::splat(32.0));
+        let resp = ui
+            .interact(r, ui.id().with("chat_search"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Search messages");
+        let active = chat_state.header_popup == HeaderPopup::Search;
+        let c = if active || resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_TERTIARY };
+        crate::icons::draw(ui.painter(), "search", r.center(), 20.0, c);
+        if resp.clicked() {
+            chat_state.header_popup = if active { HeaderPopup::None } else { HeaderPopup::Search };
+            if chat_state.header_popup == HeaderPopup::Search {
+                popup_just_opened = Some(HeaderPopup::Search);
+            }
+            chat_state.search_query.clear();
+        }
+        x -= 36.0;
+    }
+    // Inbox (unread mentions).
+    {
+        let r = Rect::from_center_size(egui::pos2(x, rect.center().y), Vec2::splat(32.0));
+        let resp = ui
+            .interact(r, ui.id().with("chat_inbox"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Inbox (unreads)");
+        let active = chat_state.header_popup == HeaderPopup::Inbox;
+        let c = if active || resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_TERTIARY };
+        crate::icons::draw(ui.painter(), "notifications", r.center(), 20.0, c);
+        if resp.clicked() {
+            chat_state.header_popup = if active { HeaderPopup::None } else { HeaderPopup::Inbox };
+            if chat_state.header_popup == HeaderPopup::Inbox {
+                popup_just_opened = Some(HeaderPopup::Inbox);
+            }
+        }
+        x -= 36.0;
+    }
+    // Pins.
+    {
+        let r = Rect::from_center_size(egui::pos2(x, rect.center().y), Vec2::splat(32.0));
+        let resp = ui
+            .interact(r, ui.id().with("chat_pins"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Pinned messages");
+        let active = chat_state.header_popup == HeaderPopup::Pins;
+        let c = if active || resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_TERTIARY };
+        crate::icons::draw(ui.painter(), "keep", r.center(), 20.0, c);
+        if resp.clicked() {
+            chat_state.header_popup = if active { HeaderPopup::None } else { HeaderPopup::Pins };
+            if chat_state.header_popup == HeaderPopup::Pins {
+                popup_just_opened = Some(HeaderPopup::Pins);
+                // Kick a pins fetch (deduped in the popup itself).
+                if let (Some(rest), Some(c)) = (crate::rest::global(), channel) {
+                    fetch_pins(rest, c.id);
+                }
+            }
+        }
+    }
+    if popup_just_opened.is_some() {
+        chat_state.header_popup_opened = Some(std::time::Instant::now());
     }
 }
 
@@ -336,6 +547,7 @@ fn render_message_row(
     chat_state: &mut ChatState,
     font_size: f32,
     compact: bool,
+    lookup: &StateLookup<'_>,
 ) {
     let row_id = ui.id().with(("msg", msg.id.0));
     let hovered_prev = ui.ctx().data(|d| d.get_temp::<bool>(row_id)).unwrap_or(false);
@@ -376,14 +588,24 @@ fn render_message_row(
                 }
                 ui.add_space(64.0);
             } else {
-                // Avatar column.
+                // Avatar column: round 40px with initials fallback; a click
+                // opens the user card.
                 let url = msg.author.avatar_url();
                 let name = msg.author.display_name().to_string();
                 let presence = app_state.presence(msg.author.id);
+                let avatar_rect = ui.next_widget_position();
                 ui.vertical(|ui| {
                     ui.add_space(2.0);
                     render_avatar(ui, &url, 40.0, &name, presence.as_deref());
                 });
+                let av_rect = Rect::from_min_size(avatar_rect + egui::vec2(0.0, 2.0), Vec2::splat(40.0));
+                let av_resp = ui
+                    .interact(av_rect, ui.id().with(("msg_avatar", msg.id.0)), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if av_resp.clicked() {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(crate::ui::members::CARD_USER_ID), msg.author.id));
+                    chat_state.card_opened = Some(std::time::Instant::now());
+                }
                 ui.add_space(12.0);
             }
 
@@ -393,12 +615,21 @@ fn render_message_row(
                 let name_font = font_size.max(14.0);
                 if !grouped {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(msg.author.display_name())
-                                .color(colors::TEXT_PRIMARY)
-                                .size(name_font)
-                                .strong(),
-                        );
+                        let name_resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(msg.author.display_name())
+                                    .color(author_color(app_state, msg, lookup))
+                                    .size(name_font)
+                                    .strong(),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("View profile");
+                        if name_resp.clicked() {
+                            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(crate::ui::members::CARD_USER_ID), msg.author.id));
+                            chat_state.card_opened = Some(std::time::Instant::now());
+                        }
                         if msg.author.bot {
                             let (brect, _) = ui.allocate_exact_size(egui::vec2(32.0, 14.0), Sense::hover());
                             let p = ui.painter_at(brect);
@@ -464,7 +695,7 @@ fn render_message_row(
                 markdown::render_message_content(
                     ui,
                     &msg.content,
-                    &NoLookup,
+                    lookup,
                     font_size,
                     msg.id.0 as usize,
                     &mut chat_state.spoilers_revealed,
@@ -480,7 +711,7 @@ fn render_message_row(
                     render_attachments(ui, msg);
                 }
                 if !msg.embeds.is_empty() {
-                    render_embeds(ui, msg, font_size);
+                    render_embeds(ui, msg, font_size, lookup);
                 }
                 if !msg.reactions.is_empty() {
                     render_reactions(ui, msg, rest.clone());
@@ -640,29 +871,37 @@ fn render_embed_header(ui: &mut Ui, e: &crate::model::Embed) {
     }
 }
 
-fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32) {
+fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32, lookup: &StateLookup<'_>) {
     for e in &msg.embeds {
-        let color = e.color.unwrap_or(0x1F_8B_4C) >> 8;
-        let r = ((color >> 16) & 0xFF) as u8;
-        let g = ((color >> 8) & 0xFF) as u8;
-        let b = (color & 0xFF) as u8;
-        let stripe = egui::Color32::from_rgb(r, g, b);
+        // Discord's embed: a dark card with a single 4px color stripe on the
+        // LEFT edge only (the old full-border stroke boxed the whole card
+        // in blue).
+        let stripe = crate::ui::members::role_color(e.color.unwrap_or(0x1F_8B_4C));
         let frame = egui::Frame::new()
             .fill(colors::EMBED_BG)
-            .stroke(egui::Stroke::new(4.0, stripe))
-            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
+            .stroke(egui::Stroke::NONE)
+            .inner_margin(egui::Margin { left: 16, right: 12, top: 8, bottom: 8 })
             .corner_radius(4.0);
-        frame.show(ui, |ui| {
+        let resp = frame.show(ui, |ui| {
             ui.set_max_width(432.0);
             ui.vertical(|ui| {
-                // Discord layout: the small thumbnail (80px) sits at the top
-                // right, beside the author/title; the big image renders below
-                // the description. Only `embed.image` is "big media".
+                tracing::debug!(thumb = ?e.thumbnail.as_ref().map(|t| (t.url.clone(), t.width, t.height)), image = ?e.image.is_some(), "EMBED-DBG");
+                // Discord layout: the thumbnail sits top-right beside the
+                // author/title with its REAL aspect ratio (a forced 80x80
+                // square used to stretch and gray-out unfurled thumbs);
+                // the big image renders below the description.
                 let has_thumb = e.thumbnail.is_some();
                 if has_thumb {
+                    let thumb = e.thumbnail.as_ref().unwrap();
+                    let thumb_size = crate::image_loader::fit_size(
+                        thumb.width,
+                        thumb.height,
+                        80.0,
+                        80.0,
+                    );
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.set_width(432.0 - 12.0 - 80.0 - 12.0);
+                            ui.set_width((432.0 - 28.0 - thumb_size.x).max(180.0));
                             render_embed_header(ui, e);
                             if let Some(desc) = &e.description {
                                 ui.add_space(2.0);
@@ -670,19 +909,19 @@ fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32) {
                                 markdown::render_message_content(
                                     ui,
                                     desc,
-                                    &NoLookup,
+                                    lookup,
                                     (font_size - 1.0).max(12.0),
                                     (msg.id.0 as usize) ^ 0xEBED,
                                     &mut revealed,
                                 );
                             }
                         });
-                        let thumb = e.thumbnail.as_ref().unwrap();
                         if let Some(url) = thumb.proxy_url.as_ref().or(Some(&thumb.url)) {
-                            crate::image_loader::render_image(
+                            tracing::debug!(?url, ?thumb_size, cursor = ?ui.cursor(), avail = ui.available_width(), "THUMB-DBG");
+                            crate::image_loader::render_image_size(
                                 ui,
                                 url,
-                                80.0,
+                                thumb_size,
                                 crate::image_loader::Shape::Rounded(4),
                             );
                         }
@@ -695,7 +934,7 @@ fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32) {
                         markdown::render_message_content(
                             ui,
                             desc,
-                            &NoLookup,
+                            lookup,
                             (font_size - 1.0).max(12.0),
                             (msg.id.0 as usize) ^ 0xEBED,
                             &mut revealed,
@@ -729,20 +968,30 @@ fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32) {
                 if let Some(img) = e.image.as_ref() {
                     if let Some(url) = img.proxy_url.as_ref().or(Some(&img.url)) {
                         ui.add_space(4.0);
-                        let w = img
-                            .width
-                            .map(|w| (w as f32).clamp(64.0, 384.0))
-                            .unwrap_or(384.0);
-                        crate::image_loader::render_image(
+                        let size = crate::image_loader::fit_size(
+                            img.width,
+                            img.height,
+                            384.0,
+                            384.0,
+                        );
+                        crate::image_loader::render_image_size(
                             ui,
                             url,
-                            w,
+                            size,
                             crate::image_loader::Shape::Rounded(6),
                         );
                     }
                 }
             });
         });
+        // The left stripe: painted onto the card's left edge after layout,
+        // rounded on the left corners to hug the card.
+        let cr = resp.response.rect;
+        ui.painter_at(cr).rect_filled(
+            Rect::from_min_max(egui::pos2(cr.min.x, cr.min.y), egui::pos2(cr.min.x + 4.0, cr.max.y)),
+            4.0,
+            stripe,
+        );
         ui.add_space(4.0);
     }
 }
@@ -762,19 +1011,20 @@ fn render_reactions(ui: &mut Ui, msg: &Message, _rest: Arc<crate::rest::Http>) {
                 .corner_radius(8.0);
             frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Emoji rendered in color (image) + count.
-                    if r.emoji.id.is_none() {
-                        if let Some(name) = r.emoji.name.as_deref() {
-                            let url = emoji::twemoji_url(name);
-                            let fallback = emoji::twemoji_url_vs16(name);
-                            crate::image_loader::render_emoji_inline(ui, &url, &fallback, 17.0, name);
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new(format!(":{}:", r.emoji.name.clone().unwrap_or_default()))
-                                .size(12.0)
-                                .color(colors::TEXT_TERTIARY),
+                    // Emoji in color: unicode via Twemoji, custom guild
+                    // emoji straight from the Discord CDN (the old code
+                    // printed ":simp:"-style text for those).
+                    if let Some(url) = r.emoji.custom_emoji_url() {
+                        crate::image_loader::render_emoji(
+                            ui,
+                            &url,
+                            17.0,
+                            r.emoji.name.as_deref().unwrap_or("emoji"),
                         );
+                    } else if let Some(name) = r.emoji.name.as_deref() {
+                        let url = emoji::twemoji_url(name);
+                        let fallback = emoji::twemoji_url_vs16(name);
+                        crate::image_loader::render_emoji_inline(ui, &url, &fallback, 17.0, name);
                     }
                     ui.label(
                         egui::RichText::new(r.count.to_string())
@@ -1044,6 +1294,279 @@ fn humansize(bytes: u64) -> String {
         return format!("{v} {}", UNITS[0]);
     }
     format!("{:.1} {}", v, UNITS[i])
+}
+
+// ───────────────────────────── header popups ─────────────────────────────
+
+/// The author's name color: their highest-ranked colored role, like the
+/// official client. Falls back to plain text when the guild or roles are
+/// unknown (DMs).
+fn author_color(app_state: &AppState, msg: &Message, lookup: &StateLookup<'_>) -> egui::Color32 {
+    let Some(guild_id) = lookup.guild_id else {
+        return colors::TEXT_PRIMARY;
+    };
+    let Some(guild) = app_state.guild_by_id(guild_id) else {
+        return colors::TEXT_PRIMARY;
+    };
+    let member = guild.members.iter().find(|m| m.user.as_ref().map(|u| u.id) == Some(msg.author.id));
+    let Some(role_ids) = member.map(|m| m.roles.clone()) else {
+        return colors::TEXT_PRIMARY;
+    };
+    let mut best: Option<(i32, egui::Color32)> = None;
+    for rid in &role_ids {
+        if let Some(role) = guild.roles.iter().find(|r| r.id == *rid) {
+            if role.color != 0 {
+                let better = match best {
+                    Some((pos, _)) => role.position > pos,
+                    None => true,
+                };
+                if better {
+                    best = Some((role.position, crate::ui::members::role_color(role.color)));
+                }
+            }
+        }
+    }
+    best.map(|(_, c)| c).unwrap_or(colors::TEXT_PRIMARY)
+}
+
+/// Fetch (and cache) a channel's pins once per channel per session.
+fn fetch_pins(rest: Arc<crate::rest::Http>, channel_id: Snowflake) {
+    static INFLIGHT: once_cell::sync::Lazy<dashmap::DashSet<u64>> = once_cell::sync::Lazy::new(dashmap::DashSet::new);
+    if !INFLIGHT.insert(channel_id.0) {
+        return;
+    }
+    tokio::spawn(async move {
+        match rest.get_channel_pins(channel_id).await {
+            Ok(msgs) => {
+                if let Some(s) = crate::state::global() {
+                    s.set_pins(channel_id, msgs);
+                    let _ = s.event_sender().send(crate::gateway::events::Event::RepaintRequested);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "fetch pins");
+                // Allow a retry on the next open if it failed.
+                INFLIGHT.remove(&channel_id.0);
+            }
+        }
+    });
+}
+
+/// Render the currently-open header popup: message search (filters the
+/// cached history live), pinned messages (REST), or the unread inbox.
+fn render_header_popup(ui: &mut Ui, app_state: &AppState, chat_state: &mut ChatState, ch: &Channel) {
+    if chat_state.header_popup == HeaderPopup::None {
+        return;
+    }
+    let vp = ui.ctx().viewport_rect();
+    let w = 340.0;
+    let h = 260.0;
+    // Below the header, right-aligned with the action icons.
+    let pos = egui::pos2(
+        (vp.max.x - w - 12.0).max(vp.min.x + 4.0),
+        (vp.min.y + 52.0).max(vp.min.y + 52.0),
+    );
+    let area_rect = Rect::from_min_size(pos, egui::vec2(w, h));
+    let frame = egui::Frame::new()
+        .fill(colors::BG_FLOATING)
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::same(10))
+        .stroke(egui::Stroke::new(1.0, colors::BG_INPUT));
+    let mut close = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    // Grace window: the click that opened the popup lands outside its rect
+    // in this same frame and would otherwise close it instantly (the same
+    // flash-open-flash-close class of bug the settings modal had).
+    let in_grace = chat_state
+        .header_popup_opened
+        .map(|t| t.elapsed() < std::time::Duration::from_millis(250))
+        .unwrap_or(true);
+    egui::Area::new(egui::Id::new("header_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(area_rect.min)
+        .interactable(true)
+        .show(ui.ctx(), |ui| {
+            frame.show(ui, |ui| {
+                ui.set_width(w - 20.0);
+                ui.set_min_height(h - 20.0);
+                ui.vertical(|ui| {
+                    match chat_state.header_popup {
+                        HeaderPopup::Search => {
+                            ui.label(
+                                egui::RichText::new("Search in this channel")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(colors::TEXT_PRIMARY),
+                            );
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut chat_state.search_query)
+                                    .desired_width(ui.available_width())
+                                    .hint_text("Type to filter loaded history…")
+                                    .font(egui::FontId::proportional(12.5)),
+                            );
+                            resp.request_focus();
+                            let needle = chat_state.search_query.trim().to_lowercase();
+                            let msgs = app_state.messages_for(ch.id);
+                            let hits: Vec<&Message> = msgs
+                                .iter()
+                                .filter(|m| !needle.is_empty() && m.content.to_lowercase().contains(&needle))
+                                .rev()
+                                .take(20)
+                                .collect();
+                            ui.add_space(4.0);
+                            if needle.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!("{} messages loaded in this channel", msgs.len()))
+                                        .size(12.0)
+                                        .color(colors::TEXT_TERTIARY),
+                                );
+                            } else if hits.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("No matches.")
+                                        .size(12.0)
+                                        .color(colors::TEXT_TERTIARY),
+                                );
+                            }
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for m in hits {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(m.author.display_name())
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(colors::TEXT_PRIMARY),
+                                            );
+                                            let snippet: String = m
+                                                .content
+                                                .chars()
+                                                .take(48)
+                                                .collect();
+                                            ui.label(
+                                                egui::RichText::new(snippet)
+                                                    .size(12.0)
+                                                    .color(colors::TEXT_SECONDARY),
+                                            );
+                                        });
+                                    }
+                                });
+                        }
+                        HeaderPopup::Pins => {
+                            ui.label(
+                                egui::RichText::new("Pinned messages")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(colors::TEXT_PRIMARY),
+                            );
+                            ui.add_space(4.0);
+                            let pins = app_state.pins_for(ch.id);
+                            if pins.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(if app_state.is_fetched(ch.id) {
+                                        "Nothing pinned here yet."
+                                    } else {
+                                        "Loading pins…"
+                                    })
+                                    .size(12.0)
+                                    .color(colors::TEXT_TERTIARY),
+                                );
+                            }
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for m in &pins {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(m.author.display_name())
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(colors::TEXT_PRIMARY),
+                                            );
+                                            let snippet: String = m
+                                                .content
+                                                .chars()
+                                                .take(48)
+                                                .collect();
+                                            ui.label(
+                                                egui::RichText::new(snippet)
+                                                    .size(12.0)
+                                                    .color(colors::TEXT_SECONDARY),
+                                            );
+                                        });
+                                    }
+                                });
+                        }
+                        HeaderPopup::Inbox => {
+                            ui.label(
+                                egui::RichText::new("Inbox — unread activity")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(colors::TEXT_PRIMARY),
+                            );
+                            ui.add_space(4.0);
+                            let unreads: Vec<(Snowflake, u32, u32)> = app_state
+                                .unread_channels()
+                                .into_iter()
+                                .collect();
+                            if unreads.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("You're all caught up.")
+                                        .size(12.0)
+                                        .color(colors::TEXT_TERTIARY),
+                                );
+                            }
+                            for (cid, n, mentions) in unreads {
+                                let label = app_state
+                                    .channel_by_id(cid)
+                                    .map(|c| c.display_name())
+                                    .unwrap_or_else(|| "unknown channel".into());
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "{} — {} unread{}",
+                                                label,
+                                                n,
+                                                if mentions > 0 { format!(" ({mentions} mentions)") } else { String::new() }
+                                            ))
+                                            .size(12.5)
+                                            .color(colors::TEXT_PRIMARY),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if resp.clicked() {
+                                    // Jump to the channel.
+                                    app_state.set_selection_sync(crate::state::Selection {
+                                        guild_id: ch.guild_id,
+                                        channel_id: Some(cid),
+                                    });
+                                    if let Some(s) = crate::state::global() {
+                                        s.mark_read(cid);
+                                    }
+                                    close = true;
+                                }
+                            }
+                        }
+                        HeaderPopup::None => {}
+                    }
+                });
+            });
+        });
+    // Outside click closes (after the grace window).
+    let outside = !in_grace
+        && ui.input(|i| {
+            i.pointer.button_clicked(egui::PointerButton::Primary)
+                && i.pointer
+                    .interact_pos()
+                    .map(|p| !area_rect.contains(p))
+                    .unwrap_or(false)
+        });
+    if close || outside {
+        chat_state.header_popup = HeaderPopup::None;
+        chat_state.header_popup_opened = None;
+        chat_state.search_query.clear();
+    }
 }
 
 // ───────────────────────────── security tests ─────────────────────────────

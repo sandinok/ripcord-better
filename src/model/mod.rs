@@ -79,16 +79,12 @@ impl User {
         if let Some(h) = &self.avatar {
             return format!("https://cdn.discordapp.com/avatars/{}/{}.{}?size=256", self.id, h, ext);
         }
-        let bucket = u64::from(self.id) % 6;
-        let color = match bucket {
-            0 => "embed",
-            1 => "purple",
-            2 => "pink",
-            3 => "green",
-            4 => "yellow",
-            _ => "blue",
-        };
-        format!("https://cdn.discordapp.com/embed/avatars/{}.png?size=128", color)
+        // Default avatars are NUMBERED 0-5 (`embed/avatars/{n}.png`), keyed
+        // by (user_id >> 22) % 6 - the same mapping the official client uses.
+        // The old color-name URLs (embed/avatars/purple.png) 404'd, which is
+        // why avatarless users rendered as broken placeholders.
+        let bucket = (u64::from(self.id) >> 22) % 6;
+        format!("https://cdn.discordapp.com/embed/avatars/{}.png?size=128", bucket)
     }
 }
 
@@ -475,11 +471,23 @@ mod tests {
     #[test]
     fn user_avatar_url_for_default_avatar_uses_embed() {
         let mut u = User::default();
-        u.id = Snowflake::from_u64(7); // 7 % 6 = 1 → purple
+        // (7 >> 22) % 6 == 0 → numbered default avatar 0.
+        u.id = Snowflake::from_u64(7);
         u.avatar = None;
         let url = u.avatar_url();
         assert!(url.contains("/embed/avatars/"), "missing avatar should fall back to embed, got {url}");
-        assert!(url.contains("purple"), "id%6=1 should map to purple, got {url}");
+        assert!(url.contains("avatars/0."), "(7>>22)%6 == 0 must map to avatar 0, got {url}");
+    }
+
+    #[test]
+    fn default_avatar_bucket_is_id_shifted() {
+        // The official mapping is (user_id >> 22) % 6, NOT id % 6.
+        let mut u = User::default();
+        u.avatar = None;
+        u.id = Snowflake::from_u64(1 << 22); // (1<<22 >> 22) % 6 = 1
+        assert!(u.avatar_url().contains("avatars/1."));
+        u.id = Snowflake::from_u64(2 << 22 | 5); // (2<<22|5 >> 22) % 6 = 2
+        assert!(u.avatar_url().contains("avatars/2."));
     }
 
     #[test]
@@ -697,6 +705,14 @@ impl ReactionEmoji {
             (_, Some(name)) => name.clone(),
             _ => String::new(),
         }
+    }
+
+    /// CDN URL for a custom (guild) emoji: animated ones are GIFs, static
+    /// ones WebP. Used to render reactions and emoji in message content.
+    pub fn custom_emoji_url(&self) -> Option<String> {
+        let id = self.id?;
+        let ext = if self.animated { "gif" } else { "webp" };
+        Some(format!("https://cdn.discordapp.com/emojis/{id}.{ext}?size=64&quality=lossless"))
     }
 }
 

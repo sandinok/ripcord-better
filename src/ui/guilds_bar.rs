@@ -34,7 +34,7 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                 if home_active { 1.0 } else { if home_resp.hovered() { 0.4 } else { 0.0 } },
                 0.15,
             );
-            let radius = lerp(22.0, 24.0, anim_t);
+            let radius = lerp(16.5, 24.0, anim_t);
             let bg = Color32::from_rgba_premultiplied(0x35, 0x39, 0x42, (90.0 + 90.0 * anim_t) as u8);
             ui.painter_at(home_rect).rect_filled(home_rect, radius, bg);
             draw_pill(ui, home_rect, anim_t);
@@ -75,19 +75,30 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                             if is_active { 1.0 } else { if resp.hovered() { 0.4 } else { 0.0 } },
                             0.15,
                         );
-                        // Rest = rounded square (r22, Discord-2024 style),
-                        // hover/active morphs to a full circle, with a subtle
-                        // scale-up on hover.
-                        let radius = lerp(22.0, 24.0, anim_t);
+                        // Discord-2024 squircle: 16.5px radius at rest, morphing
+                        // to a circle (24 = 48/2) on hover/active, with a
+                        // subtle scale-up. The corner mask is baked into the
+                        // icon texture at decode, so the image itself is
+                        // rounded instead of covering the shape with a
+                        // square (the "square server icons" bug).
+                        let radius = lerp(16.5, 24.0, anim_t);
                         let grow = 2.0 * anim_t;
                         let icon_rect = Rect::from_center_size(
                             rect.center(),
                             Vec2::splat(BTN + grow),
                         );
+                        let icon_url = g.icon_url();
                         let accent = pick_accent_for(&g.id);
-                        let bg = if is_active { accent } else { accent.gamma_multiply(0.62) };
                         let painter = ui.painter_at(icon_rect);
-                        painter.rect_filled(icon_rect, radius, bg);
+                        // Background: the accent color shows for initial-only
+                        // guilds; for guilds WITH an icon it only shows as a
+                        // loading placeholder behind the image.
+                        if icon_url.is_none() {
+                            let bg = if is_active { accent } else { accent.gamma_multiply(0.62) };
+                            painter.rect_filled(icon_rect, radius, bg);
+                        } else {
+                            painter.rect_filled(icon_rect, radius, colors::BG_ACCENT);
+                        }
                         if resp.hovered() && !is_active {
                             painter.rect_filled(
                                 icon_rect,
@@ -95,19 +106,27 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                                 Color32::from_rgba_premultiplied(255, 255, 255, 26),
                             );
                         }
-                        // Guild icon image or initials.
-                        if let Some(url) = g.icon_url() {
-                            crate::ui::allocate_ui_at_rect(ui, icon_rect, |ui| {
-                                crate::image_loader::render_image(ui, &url, icon_rect.width(), crate::image_loader::Shape::Square);
-                            });
-                        } else {
-                            painter.text(
-                                icon_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                g.initials(),
-                                egui::FontId::proportional(16.0),
-                                colors::TEXT_PRIMARY,
-                            );
+                        // Guild icon image (rounded corners baked in) or initials.
+                        match icon_url {
+                            Some(url) => {
+                                crate::ui::allocate_ui_at_rect(ui, icon_rect, |ui| {
+                                    crate::image_loader::render_image(
+                                        ui,
+                                        &url,
+                                        icon_rect.width(),
+                                        crate::image_loader::Shape::Rounded(34),
+                                    );
+                                });
+                            }
+                            None => {
+                                painter.text(
+                                    icon_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    g.initials(),
+                                    egui::FontId::proportional(16.0),
+                                    colors::TEXT_PRIMARY,
+                                );
+                            }
                         }
                         draw_pill(ui, rect, anim_t);
                         // Unread badge.
@@ -140,7 +159,7 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                     if resp.hovered() { 0.4 } else { 0.0 },
                     0.15,
                 );
-                let radius = lerp(22.0, 24.0, anim_t);
+                let radius = lerp(16.5, 24.0, anim_t);
                 let bg = if anim_t > 0.2 { colors::GREEN } else { colors::GREEN.gamma_multiply(0.75) };
                 ui.painter_at(rect).rect_filled(rect, radius, bg);
                 crate::icons::draw(ui.painter(), "add", rect.center(), 24.0, colors::TEXT_PRIMARY);
@@ -157,7 +176,7 @@ pub fn render(ui: &mut Ui, app_state: &AppState, rest: std::sync::Arc<crate::res
                     if resp.hovered() { 0.4 } else { 0.0 },
                     0.15,
                 );
-                let radius = lerp(22.0, 24.0, anim_t);
+                let radius = lerp(16.5, 24.0, anim_t);
                 let bg = Color32::from_rgba_premultiplied(0x35, 0x39, 0x42, (90.0 + 90.0 * anim_t) as u8);
                 ui.painter_at(rect).rect_filled(rect, radius, bg);
                 crate::icons::draw(ui.painter(), "settings", rect.center(), 26.0, colors::TEXT_PRIMARY);

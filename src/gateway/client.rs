@@ -62,8 +62,26 @@ pub enum Outbound {
     Connect { token: String, bot: bool },
     /// Send a presence update (the gateway accepts this any time after READY).
     SetPresence { status: String, afk: bool },
+    /// Ask Discord for the full member list of a guild (op 8). Delivered
+    /// back as GUILD_MEMBERS_CHUNK dispatches, which feed the member list.
+    RequestMembers { guild_id: crate::model::Snowflake },
     /// Soft-shutdown the gateway task.
     Shutdown,
+}
+
+/// Build the op-8 REQUEST_GUILD_MEMBERS payload: `query: ""` + `limit: 0`
+/// means "the entire guild, in chunks"; `presences: true` asks Discord to
+/// attach status dots to every member it sends.
+fn request_members_payload(guild_id: crate::model::Snowflake) -> serde_json::Value {
+    serde_json::json!({
+        "op": GatewayOp::RequestGuildMembers as u8,
+        "d": {
+            "guild_id": guild_id.0.to_string(),
+            "query": "",
+            "limit": 0,
+            "presences": true,
+        }
+    })
 }
 
 pub struct Gateway {
@@ -91,6 +109,10 @@ impl Gateway {
     }
 
     pub fn spawn(self: Arc<Self>) {
+        // Publish the outbound sender process-wide so UI code (member list)
+        // can request guild members via op 8 without threading the handle
+        // through every widget.
+        let _ = super::install_outbound(self.outbound_tx.clone());
         tokio::spawn(async move {
             let state = self.state.clone();
             let mut outbound_rx = self.outbound_rx.lock().take().expect("outbound_rx taken twice");
@@ -125,6 +147,10 @@ impl Gateway {
                             Outbound::SetPresence { .. } => {
                                 // Not connected yet: the status will be sent
                                 // with the IDENTIFY payload on the next connect.
+                            }
+                            Outbound::RequestMembers { .. } => {
+                                // Not connected yet: the member panel retries
+                                // via its REST fallback; re-request later.
                             }
                             Outbound::Shutdown => { break; }
                         }
@@ -242,6 +268,18 @@ mod tests {
         assert!(steps.iter().all(|&s| s <= super::MAX_BACKOFF_MS));
         assert_eq!(steps[9], super::MAX_BACKOFF_MS);
     }
+
+    /// op 8 payload shape: query="" + limit=0 means "the whole guild", and
+    /// guild_id must serialize as a STRING (the wire format Discord expects).
+    #[test]
+    fn request_members_payload_shape() {
+        let v = super::request_members_payload(crate::model::Snowflake::from_u64(123));
+        assert_eq!(v["op"], 8);
+        assert_eq!(v["d"]["guild_id"], serde_json::json!("123"));
+        assert_eq!(v["d"]["query"], "");
+        assert_eq!(v["d"]["limit"], 0);
+        assert_eq!(v["d"]["presences"], true);
+    }
 }
 
 
@@ -271,6 +309,17 @@ async fn run_connection_loop(
     state.set_connection_status(crate::state::ConnectionStatus::Connecting).await;
     tracing::info!(url = GATEWAY_URL, "connecting to gateway");
 
+    // RESUME must go to the gateway URL Discord handed us in READY
+    // (`resume_gateway_url`) - resuming against a stale host is the classic
+    // cause of invalid-session loops.
+    let session = state.session_snapshot().await;
+    let ws_url = session
+        .as_ref()
+        .map(|s| s.resume_gateway_url.clone())
+        .filter(|u| u.starts_with("wss://"))
+        .unwrap_or_else(|| GATEWAY_URL.to_string());
+    tracing::info!(url = %ws_url, "connecting");
+
     // Browser-shaped handshake: a real browser always sends `Origin` on a
     // websocket upgrade, and the UA must match the one the REST layer uses
     // (and the one claimed in IDENTIFY properties) or the session reads as
@@ -284,7 +333,7 @@ async fn run_connection_loop(
     // (Host, Connection, Upgrade, Sec-WebSocket-Key, Sec-WebSocket-Version);
     // a hand-built Request without them is rejected by the server.
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = GATEWAY_URL
+    let mut request = ws_url
         .into_client_request()
         .map_err(|e| anyhow!("gateway request build: {e}"))?;
     let headers = request.headers_mut();
@@ -303,9 +352,8 @@ async fn run_connection_loop(
     tracing::info!(interval_ms = heartbeat_interval, "HELLO received");
 
     // Send IDENTIFY or RESUME.
-    let session = state.session_snapshot().await;
     let last_seq = state.last_seq().await;
-    let (session_id, resume_gateway_url, identify_or_resume) = match (&session, last_seq) {
+    let identify_or_resume = match (&session, last_seq) {
         (Some(s), Some(seq)) => {
             let resume_payload = serde_json::json!({
                 "op": GatewayOp::Resume as u8,
@@ -315,7 +363,7 @@ async fn run_connection_loop(
                     "seq": seq,
                 }
             });
-            (Some(s.session_id.clone()), Some(s.resume_gateway_url.clone()), resume_payload)
+            resume_payload
         }
         _ => {
             // Bot accounts reject the user-client fields (capabilities,
@@ -324,7 +372,8 @@ async fn run_connection_loop(
             // sessions get the full web-client shape with properties that
             // match the OS, the User-Agent and the browser we claim
             // elsewhere (see src/identity.rs).
-            let identify = if is_bot {
+            
+            if is_bot {
                 serde_json::json!({
                     "op": GatewayOp::Identify as u8,
                     "d": {
@@ -355,11 +404,9 @@ async fn run_connection_loop(
                         }
                     }
                 })
-            };
-            (None, None, identify)
+            }
         }
     };
-    let _ = (session_id, resume_gateway_url);
     sink.send(WsMessage::Binary(bytes::Bytes::from(identify_or_resume.to_string().into_bytes()))).await?;
     state.set_connection_status(crate::state::ConnectionStatus::Connected).await;
 
@@ -392,9 +439,47 @@ async fn run_connection_loop(
             biased;
             _ = heartbeat_rx.recv() => {
                 if !state.heartbeat_acked() {
-                    tracing::error!("heartbeat ACK missing - reconnecting (RESUME)");
-                    should_resume = true;
-                    break;
+                    // The ACK may already be sitting in the socket buffer
+                    // behind frames we simply have not read yet (the UI
+                    // thread and this loop share one runtime; a burst of
+                    // image traffic used to delay reads long enough to
+                    // trip this check while the connection was perfectly
+                    // healthy). Give the stream a short, bounded chance to
+                    // deliver the ACK before declaring the session dead.
+                    let mut revived = false;
+                    if let Ok(Some(Ok(frame))) = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        stream.next(),
+                    ).await {
+                        match frame {
+                            WsMessage::Binary(b) => {
+                                if let Ok(Some(decoded)) = zlib.push_bytes(&b) {
+                                    match handle_decoded(&decoded, &state, &mut sink).await {
+                                        Ok(Flow::Continue) => revived = state.heartbeat_acked(),
+                                        other => { tracing::warn!(?other, "frame during ACK grace ended the connection"); }
+                                    }
+                                }
+                            }
+                            WsMessage::Text(t) => {
+                                match handle_decoded(t.as_bytes(), &state, &mut sink).await {
+                                    Ok(Flow::Continue) => revived = state.heartbeat_acked(),
+                                    other => { tracing::warn!(?other, "text frame during ACK grace"); }
+                                }
+                            }
+                            WsMessage::Ping(p) => {
+                                let _ = sink.send(WsMessage::Pong(p)).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !revived {
+                        tracing::warn!(
+                            "no heartbeat ACK after grace - session presumed dead, RESUME"
+                        );
+                        should_resume = true;
+                        break;
+                    }
+                    tracing::info!("heartbeat ACK arrived during grace period");
                 }
                 let seq = state.last_seq().await;
                 let hb = serde_json::json!({
@@ -412,6 +497,18 @@ async fn run_connection_loop(
                 match cmd {
                     Outbound::Connect { .. } => {
                         // Already connected: a redundant Connect is a no-op.
+                    }
+                    Outbound::RequestMembers { guild_id } => {
+                        // op 8: the member list + presences arrive as
+                        // GUILD_MEMBERS_CHUNK dispatches (see events.rs).
+                        let req = request_members_payload(guild_id);
+                        if sink
+                            .send(WsMessage::Binary(bytes::Bytes::from(req.to_string().into_bytes())))
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("member request send failed (disconnected?)");
+                        }
                     }
                     Outbound::SetPresence { status, afk } => {
                         // Mirror the requested status locally too.

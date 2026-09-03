@@ -137,8 +137,10 @@ pub struct AppState {
     mentions: RwLock<HashMap<Snowflake, u32>>,
     // Live typing indicators per channel.
     typing: RwLock<HashMap<Snowflake, Vec<TypingUser>>>,
-    // Member user-ids per guild (from GUILD_CREATE / REST).
+    // Member user-ids per guild (from GUILD_CREATE / op-8 chunks / REST).
     guild_members: RwLock<HashMap<Snowflake, Vec<Snowflake>>>,
+    // Pinned messages per channel (from GET /channels/{id}/pins).
+    pins: RwLock<HashMap<Snowflake, Vec<Message>>>,
     // True when the gateway had to drop privileged intents (presence data
     // unavailable) - surfaced in the UI so the user knows why dots are gray.
     intents_limited: ArcSwap<bool>,
@@ -180,6 +182,7 @@ impl AppState {
             mentions: RwLock::new(HashMap::new()),
             typing: RwLock::new(HashMap::new()),
             guild_members: RwLock::new(HashMap::new()),
+            pins: RwLock::new(HashMap::new()),
             intents_limited: ArcSwap::from_pointee(false),
             event_tx,
         }
@@ -421,6 +424,20 @@ impl AppState {
     pub fn total_mentions(&self) -> u32 {
         self.mentions.read().values().sum()
     }
+    /// Channels with unread activity: (channel_id, unread, mentions).
+    pub fn unread_channels(&self) -> Vec<(Snowflake, u32, u32)> {
+        let unread = self.unread.read();
+        let mentions = self.mentions.read();
+        let mut out: Vec<(Snowflake, u32, u32)> = unread
+            .iter()
+            .map(|(cid, n)| {
+                let m = mentions.get(cid).copied().unwrap_or(0);
+                (*cid, *n, m)
+            })
+            .collect();
+        out.sort_by_key(|(_, n, m)| std::cmp::Reverse(*n + *m));
+        out
+    }
     pub fn mark_read(&self, channel_id: Snowflake) {
         self.unread.write().remove(&channel_id);
         self.mentions.write().remove(&channel_id);
@@ -447,6 +464,16 @@ impl AppState {
     }
     pub fn set_guild_members(&self, guild_id: Snowflake, ids: Vec<Snowflake>) {
         self.guild_members.write().insert(guild_id, ids);
+    }
+
+    // ── Pins ──
+
+    /// Replace the cached pin list for a channel (from REST).
+    pub fn set_pins(&self, channel_id: Snowflake, msgs: Vec<Message>) {
+        self.pins.write().insert(channel_id, msgs);
+    }
+    pub fn pins_for(&self, channel_id: Snowflake) -> Vec<Message> {
+        self.pins.read().get(&channel_id).cloned().unwrap_or_default()
     }
 
     // ── Typing ──
@@ -480,6 +507,10 @@ impl AppState {
             Event::Ready { d } => {
                 self.set_session(d.session_id.clone(), d.resume_gateway_url.clone()).await;
                 *self.current_user.write() = Some(d.user.clone());
+                // Cache our own user record too: the member panel resolves
+                // every row through the user cache, and the bot itself is
+                // always a member.
+                self.touch_user(&d.user);
                 *self.guilds.write() = d.guilds.clone();
                 for u in &d.users {
                     self.touch_user(u);
@@ -526,6 +557,29 @@ impl AppState {
                 }
                 for p in &d.presences {
                     self.set_presence(p.user.id, &p.status);
+                }
+            }
+            Event::GuildMembersChunk { d } => {
+                // Op 8 answer: merge the chunk's members into the guild's
+                // list (union, idempotent - re-requests are safe) and cache
+                // every user record + presence it carries.
+                let mut ids = self.guild_member_ids(d.guild_id);
+                for m in &d.members {
+                    if let Some(u) = &m.user {
+                        self.touch_user(u);
+                        if !ids.contains(&u.id) {
+                            ids.push(u.id);
+                        }
+                    }
+                }
+                if !ids.is_empty() {
+                    self.guild_members.write().insert(d.guild_id, ids);
+                }
+                for p in &d.presences {
+                    self.set_presence(p.user.id, &p.status);
+                }
+                if d.chunk_index + 1 >= d.chunk_count.max(1) {
+                    tracing::debug!(guild = %d.guild_id, "member list complete");
                 }
             }
             Event::GuildDelete { d } => {
@@ -997,5 +1051,67 @@ mod tests {
         tokio_block_on(s.dispatch_event(e.clone()));
         tokio_block_on(s.dispatch_event(e));
         assert_eq!(s.messages_for(Snowflake(1)).len(), 1);
+    }
+
+    #[test]
+    fn guild_members_chunk_merges_members_and_presences() {
+        let s = AppState::new();
+        let chunk = crate::gateway::events::Event::GuildMembersChunk {
+            d: Box::new(crate::gateway::events::GuildMembersChunkData {
+                guild_id: Snowflake(5),
+                members: vec![
+                    crate::model::Member {
+                        user: Some(crate::model::User {
+                            id: Snowflake(100),
+                            username: "alice".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    crate::model::Member {
+                        user: Some(crate::model::User {
+                            id: Snowflake(101),
+                            username: "bob".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                presences: vec![crate::model::PresenceUpdate {
+                    user: crate::model::PartialUser {
+                        id: Snowflake(100),
+                        ..Default::default()
+                    },
+                    status: "online".into(),
+                    ..Default::default()
+                }],
+                chunk_index: 0,
+                chunk_count: 1,
+                ..Default::default()
+            }),
+        };
+        tokio_block_on(s.dispatch_event(chunk));
+        let ids = s.guild_member_ids(Snowflake(5));
+        assert_eq!(ids.len(), 2, "both members known");
+        assert_eq!(s.user(Snowflake(100)).unwrap().username, "alice");
+        assert_eq!(s.presence(Snowflake(100)).as_deref(), Some("online"));
+        // A second (re-requested) chunk must not duplicate anyone.
+        let chunk2 = crate::gateway::events::Event::GuildMembersChunk {
+            d: Box::new(crate::gateway::events::GuildMembersChunkData {
+                guild_id: Snowflake(5),
+                members: vec![crate::model::Member {
+                    user: Some(crate::model::User {
+                        id: Snowflake(100),
+                        username: "alice".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                chunk_count: 1,
+                ..Default::default()
+            }),
+        };
+        tokio_block_on(s.dispatch_event(chunk2));
+        assert_eq!(s.guild_member_ids(Snowflake(5)).len(), 2, "merge is idempotent");
     }
 }

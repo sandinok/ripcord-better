@@ -78,11 +78,13 @@ fn main() -> ExitCode {
         }
     };
 
-    // Single-worker runtime. Cuts idle thread stacks from ~8 MB to ~2 MB
-    // and we don't need parallel HTTP for a chat client.
+    // Two async workers: one is enough for REST, but the gateway heartbeats
+    // must never queue behind a busy worker (a stalled heartbeat is how
+    // "Connection lost" sessions die). Image decode runs on the blocking
+    // pool (see image_loader), so 2 + 8 threads stays ~10 MB of stacks.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .max_blocking_threads(2)
+        .worker_threads(2)
+        .max_blocking_threads(8)
         .enable_all()
         .thread_name("basalt-worker")
         .thread_stack_size(256 * 1024)

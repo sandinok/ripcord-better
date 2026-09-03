@@ -6,6 +6,16 @@
 //!   - CPU-side corner masks (rounded avatars) applied once at decode.
 //!   - A failed-fetch cooldown so a dead CDN is not hammered every frame.
 //!   - An inline emoji renderer with a fallback URL variant.
+//!
+//! Two hard rules learned the hard way:
+//!   1. Every CDN request MUST carry a User-Agent. cdn.discordapp.com sits
+//!      behind Cloudflare, which 403s UA-less requests (reqwest sends none
+//!      by default) - that is why avatars/emoji/embed thumbs used to show
+//!      as gray placeholders.
+//!   2. Decode + resize + mask are CPU work and run in `spawn_blocking`.
+//!      They used to run inline on the single tokio worker, where a burst
+//!      of image loads starved the gateway heartbeats and Discord dropped
+//!      the session ("Connection lost - reconnecting").
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -15,6 +25,20 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 static GLOBAL_CACHE: Lazy<ImageCache> = Lazy::new(ImageCache::new);
+
+/// Shared HTTP client for all image fetches: connection pooling, a real
+/// User-Agent (Cloudflare rejects UA-less requests), and hard timeouts so a
+/// dead CDN can never leave a fetch (and its UI placeholder) stuck forever.
+static IMAGE_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .user_agent(crate::identity::image_user_agent())
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(8))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(8)
+        .build()
+        .expect("image http client init")
+});
 
 pub fn global_cache() -> &'static ImageCache {
     &GLOBAL_CACHE
@@ -131,15 +155,29 @@ async fn fetch_and_install(
     max_h: u32,
     shape: Shape,
 ) -> anyhow::Result<TextureHandle> {
-    let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
-    let img = image::load_from_memory(&bytes)?;
-    let img = if img.width() > max_w || img.height() > max_h {
-        img.resize(max_w, max_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
-    let mut rgba = img.to_rgba8();
-    apply_shape(&mut rgba, shape);
+    let bytes = IMAGE_HTTP
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?
+        .to_vec();
+    // Decode + resize + corner-mask are CPU-heavy (Lanczos3 on a 600px
+    // banner is ~100ms+). Run them on the blocking pool so the async
+    // worker stays free for gateway heartbeats.
+    let rgba = tokio::task::spawn_blocking(move || -> anyhow::Result<image::RgbaImage> {
+        let img = image::load_from_memory(&bytes)?;
+        let img = if img.width() > max_w || img.height() > max_h {
+            img.resize(max_w, max_h, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        };
+        let mut rgba = img.to_rgba8();
+        apply_shape(&mut rgba, shape);
+        Ok(rgba)
+    })
+    .await??;
     let size = [rgba.width() as usize, rgba.height() as usize];
     let color = ColorImage::from_rgba_unmultiplied(size, &rgba);
     let handle = ctx.load_texture(key, color, TextureOptions::LINEAR);
@@ -160,18 +198,17 @@ fn apply_shape(img: &mut image::RgbaImage, shape: Shape) {
         }
         Shape::Circle => w.min(h) as f32 / 2.0,
     };
-    let r = radius;
-    // Distance from the outside of the nearest corner arc center.
+    // Clamp the radius so the core rect stays valid on narrow images.
+    let r = radius.min(w as f32 / 2.0).min(h as f32 / 2.0);
+    // Signed distance to the rounded-rect boundary: clamp the point into
+    // the "core" rect (the rect minus the corner radii), then measure the
+    // distance to the clamped point. The old expression used
+    // `x.min(r).max(w-r)`, which collapses to `w-r` for nearly every x and
+    // wiped the whole image except a small blob at the bottom-right
+    // corner - that was the "avatars render as tiny dots" bug.
     let corner = |x: f32, y: f32| -> f32 {
-        // Arc centers in each corner.
-        let cx = x
-            .min(r)
-            .max((w as f32) - r)
-            .max(0.0);
-        let cy = y
-            .min(r)
-            .max((h as f32) - r)
-            .max(0.0);
+        let cx = x.clamp(r, (w as f32) - r);
+        let cy = y.clamp(r, (h as f32) - r);
         ((x - cx).hypot(y - cy) - r).clamp(-1.0, 1.0)
     };
     for y in 0..h {
@@ -208,8 +245,10 @@ pub fn paint_status_dot(painter: &Painter, avatar_rect: Rect, status: &str, ring
     }
 }
 
-/// Convenience widget: render an avatar at `size` px with rounded corners,
-/// plus an optional status dot. Shows an initial placeholder while loading.
+/// Convenience widget: render an avatar at `size` px, plus an optional
+/// status dot. Discord renders avatars as full circles everywhere (message
+/// rows, member list, user box); the fallback shows the user's initial
+/// while the texture loads.
 pub fn render_avatar(
     ui: &mut Ui,
     url: &str,
@@ -217,7 +256,7 @@ pub fn render_avatar(
     fallback_initials: &str,
     status: Option<&str>,
 ) {
-    render_avatar_ex(ui, url, size, fallback_initials, status, Shape::Rounded(22), crate::colors::BG_FLOATING);
+    render_avatar_ex(ui, url, size, fallback_initials, status, Shape::Circle, crate::colors::BG_FLOATING);
 }
 
 /// Avatar with explicit shape + ring color.
@@ -261,18 +300,45 @@ fn corner_radius_for(shape: Shape, size: f32) -> f32 {
     }
 }
 
+/// Compute the display size for an image with a known source aspect
+/// ratio, constrained to fit inside `max_w x max_h` (like CSS
+/// `max-width/max-height` with `auto` on the other axis). Returns a
+/// square when the source dimensions are unknown.
+pub fn fit_size(src_w: Option<u32>, src_h: Option<u32>, max_w: f32, max_h: f32) -> Vec2 {
+    match (src_w, src_h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            let ar = w as f32 / h as f32;
+            let mut out = egui::vec2(max_w, max_w / ar);
+            if out.y > max_h {
+                out = egui::vec2(max_h * ar, max_h);
+            }
+            out
+        }
+        _ => Vec2::splat(max_w.min(max_h)),
+    }
+}
+
 /// Convenience widget: render a square/rounded image at `size` px.
 pub fn render_image(ui: &mut Ui, url: &str, size: f32, shape: Shape) {
+    render_image_size(ui, url, Vec2::splat(size), shape);
+}
+
+/// Render an image inside a `size` (w x h) rect. The rect is reserved even
+/// while the texture loads, so layout never jumps; embed thumbnails and
+/// attachments use this with their real aspect ratio instead of a forced
+/// square (which stretched every unfurled image).
+pub fn render_image_size(ui: &mut Ui, url: &str, size: Vec2, shape: Shape) {
     let cache = global_cache();
     let ctx = ui.ctx().clone();
-    if let Some(handle) = cache.get_or_fetch(&ctx, url, (size * 2.0) as u32, (size * 2.0) as u32, shape) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let max_w = (size.x.max(1.0) * 2.0) as u32;
+    let max_h = (size.y.max(1.0) * 2.0) as u32;
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if let Some(handle) = cache.get_or_fetch(&ctx, url, max_w, max_h, shape) {
         let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
         ui.painter_at(rect).image(handle.id(), rect, uv, egui::Color32::WHITE);
     } else {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
         let painter = ui.painter_at(rect);
-        let r = corner_radius_for(shape, size);
+        let r = corner_radius_for(shape, size.min_elem());
         painter.rect_filled(rect, r, egui::Color32::from_rgb(0x38, 0x3A, 0x40));
     }
 }
@@ -377,6 +443,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fit_size_preserves_aspect() {
+        // 16:9 source in a 384x384 box -> 384x216.
+        let s = fit_size(Some(1600), Some(900), 384.0, 384.0);
+        assert!((s.x - 384.0).abs() < 0.5, "got {s:?}");
+        assert!((s.y - 216.0).abs() < 0.5, "got {s:?}");
+        // Portrait 9:16 in a 384x384 box -> height-bound: 216x384.
+        let s = fit_size(Some(900), Some(1600), 384.0, 384.0);
+        assert!((s.x - 216.0).abs() < 0.5, "got {s:?}");
+        assert!((s.y - 384.0).abs() < 0.5, "got {s:?}");
+        // Unknown source -> square of the smaller bound.
+        let s = fit_size(None, None, 80.0, 384.0);
+        assert_eq!(s, Vec2::splat(80.0));
+    }
+
+    #[test]
     fn shape_cache_keys_differ() {
         assert_eq!(cache_key("http://x/a.png", Shape::Square), "http://x/a.png");
         assert_eq!(cache_key("http://x/a.png", Shape::Rounded(22)), "http://x/a.png#r22");
@@ -392,6 +473,31 @@ mod tests {
         assert_eq!(img.get_pixel(10, 10).0[3], 255);
         // Corner transparent.
         assert_eq!(img.get_pixel(1, 1).0[3], 0);
+    }
+
+    /// Regression test for the "avatars as dots" bug: `x.min(r).max(w-r)`
+    /// collapsed to `w-r` for nearly every x, erasing everything but a
+    /// bottom-right blob. A rounded mask must keep the image body visible.
+    #[test]
+    fn rounded_mask_keeps_body_opaque_on_wide_images() {
+        let (w, h) = (160u32, 90u32);
+        let mut img = image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255]));
+        apply_shape(&mut img, Shape::Rounded(4));
+        // Pixels with any visibility (the 1px edge feather counts).
+        let visible = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| img.get_pixel(x, y).0[3] > 0)
+            .count();
+        // Over 97% of the image must remain visible (only corner arcs and
+        // the feather band at the perimeter are cut).
+        assert!(
+            visible as f32 / (w * h) as f32 > 0.97,
+            "rounded mask erased the image body: only {visible}/{} visible",
+            w * h
+        );
+        // And the extreme corners ARE cut.
+        assert_eq!(img.get_pixel(0, 0).0[3], 0);
+        assert_eq!(img.get_pixel(w - 1, h - 1).0[3], 0);
     }
 
     #[test]

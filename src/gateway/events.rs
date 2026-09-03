@@ -21,6 +21,10 @@ pub enum Event {
     /// A guild's full payload arrived (channels, roles, members chunk,
     /// emojis, presences). Discord sends these in chunks.
     GuildCreate { d: Guild },
+    /// A slice of a guild's member list, delivered after an op 8
+    /// REQUEST_GUILD_MEMBERS (or lazily for large guilds). Carries member
+    /// records plus live presences.
+    GuildMembersChunk { d: Box<GuildMembersChunkData> },
     GuildDelete { d: Value },
     GuildUpdate { d: Guild },
     /// A new channel in a guild (or the channel we joined).
@@ -89,6 +93,25 @@ pub struct ReadyPayload {
     pub consents: Value,
 }
 
+/// GUILD_MEMBERS_CHUNK payload (op 0, t=GUILD_MEMBERS_CHUNK): a slice of
+/// the guild's member list, requested via op 8 (or streamed by Discord for
+/// large guilds). `presences` ride along when requested with
+/// `presences: true`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct GuildMembersChunkData {
+    pub guild_id: crate::model::Snowflake,
+    #[serde(default)]
+    pub members: Vec<crate::model::Member>,
+    #[serde(default)]
+    pub presences: Vec<crate::model::PresenceUpdate>,
+    #[serde(default)]
+    pub chunk_index: u32,
+    #[serde(default)]
+    pub chunk_count: u32,
+    #[serde(default)]
+    pub not_found: Vec<crate::model::Snowflake>,
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct PartialMessage {
     pub id: Snowflake,
@@ -154,6 +177,13 @@ pub fn parse_dispatch(event_name: &str, d: Value) -> Event {
             }
         },
         "GUILD_DELETE" => Event::GuildDelete { d },
+        "GUILD_MEMBERS_CHUNK" => match serde_json::from_value::<GuildMembersChunkData>(d.clone()) {
+            Ok(c) => Event::GuildMembersChunk { d: Box::new(c) },
+            Err(e) => {
+                tracing::warn!(error = %e, "GUILD_MEMBERS_CHUNK parse error");
+                Event::Unknown { name: "GUILD_MEMBERS_CHUNK".into(), d }
+            }
+        },
         "GUILD_UPDATE" => match serde_json::from_value::<Guild>(d.clone()) {
             Ok(g) => Event::GuildUpdate { d: g },
             Err(_) => Event::Unknown { name: "GUILD_UPDATE".into(), d },
