@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local config (contains encrypted token vault)
+/config.toml
+config.toml

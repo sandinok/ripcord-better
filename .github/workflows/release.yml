@@ -1,0 +1,82 @@
+name: Release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach binaries to (e.g. v0.1.0)"
+        required: true
+        type: string
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+            binary: basalt.exe
+            archive: basalt-${{ inputs.tag || github.ref_name }}-windows-x86_64.zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+            binary: basalt
+            archive: basalt-${{ inputs.tag || github.ref_name }}-macos-arm64.tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+            binary: basalt
+            archive: basalt-${{ inputs.tag || github.ref_name }}-linux-x86_64.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Test (native)
+        if: matrix.os != 'windows-latest' || matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test --release
+
+      - name: Package (zip)
+        if: matrix.name == 'windows-x86_64'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
+          (cd dist && zip -q "${{ matrix.archive }}" ${{ matrix.binary }})
+
+      - name: Package (tar.gz)
+        if: matrix.name != 'windows-x86_64'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
+          (cd dist && tar czf "${{ matrix.archive }}" ${{ matrix.binary }})
+
+      - name: Attach to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # Create the release if it does not exist yet, then upload.
+          gh release view "$TAG" 2>/dev/null || gh release create "$TAG" --title "Basalt $TAG" --notes "Release notes."
+          gh release upload "$TAG" "dist/${{ matrix.archive }}" --clobber
