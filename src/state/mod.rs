@@ -141,9 +141,37 @@ pub struct AppState {
     guild_members: RwLock<HashMap<Snowflake, Vec<Snowflake>>>,
     // Pinned messages per channel (from GET /channels/{id}/pins).
     pins: RwLock<HashMap<Snowflake, Vec<Message>>>,
+    // Channels with pin updates the user has not viewed yet (red dot on
+    // the header pins button).
+    pins_unread: RwLock<std::collections::HashSet<Snowflake>>,
     // True when the gateway had to drop privileged intents (presence data
     // unavailable) - surfaced in the UI so the user knows why dots are gray.
     intents_limited: ArcSwap<bool>,
+
+    // ── v0.2 additions ──
+    // Send lock: Some(reason) = the sender worker refuses every send
+    // (Discord blocked/captcha'd us). Only the user clears it (Retry).
+    send_lock: RwLock<Option<String>>,
+    // user_id -> full presence (status + activities) for member rows and
+    // profile popups.
+    presence_full: RwLock<HashMap<Snowflake, crate::model::PresenceUpdate>>,
+    // guild_id -> connected voice states (user_id -> channel_id).
+    voice_states: RwLock<HashMap<Snowflake, HashMap<Snowflake, Option<Snowflake>>>>,
+    // guild_id -> custom emoji list (picker, mentions rendering).
+    guild_emojis: RwLock<HashMap<Snowflake, Vec<crate::model::Emoji>>>,
+    // message_id -> referenced (replied-to) message fetched out-of-band.
+    referenced_messages: RwLock<HashMap<Snowflake, Message>>,
+    // url -> YouTube oEmbed metadata (title, author, thumbnail).
+    oembed: RwLock<HashMap<String, crate::model::OEmbedInfo>>,
+    // user_id -> fetched profile (bio, pronouns) for profile popups.
+    profiles: RwLock<HashMap<Snowflake, crate::model::UserProfile>>,
+    // guild_id -> scheduled events.
+    events: RwLock<HashMap<Snowflake, Vec<crate::model::ScheduledEvent>>>,
+    // Pinned DM channel ids (session mirror of the config list).
+    pinned_dms: RwLock<std::collections::HashSet<Snowflake>>,
+    // Relationships (friends) page state.
+    relationships_len: RwLock<Option<usize>>,
+    relationships_unavailable: RwLock<Option<String>>,
 
     event_tx: mpsc::UnboundedSender<Event>,
 }
@@ -183,7 +211,19 @@ impl AppState {
             typing: RwLock::new(HashMap::new()),
             guild_members: RwLock::new(HashMap::new()),
             pins: RwLock::new(HashMap::new()),
+            pins_unread: RwLock::new(std::collections::HashSet::new()),
             intents_limited: ArcSwap::from_pointee(false),
+            send_lock: RwLock::new(None),
+            presence_full: RwLock::new(HashMap::new()),
+            voice_states: RwLock::new(HashMap::new()),
+            guild_emojis: RwLock::new(HashMap::new()),
+            referenced_messages: RwLock::new(HashMap::new()),
+            oembed: RwLock::new(HashMap::new()),
+            profiles: RwLock::new(HashMap::new()),
+            events: RwLock::new(HashMap::new()),
+            pinned_dms: RwLock::new(std::collections::HashSet::new()),
+            relationships_len: RwLock::new(None),
+            relationships_unavailable: RwLock::new(None),
             event_tx,
         }
     }
@@ -454,6 +494,19 @@ impl AppState {
             || me.map(|m| msg.mentions.iter().any(|u| u.id == m)).unwrap_or(false);
         if mentions_me {
             *self.mentions.write().entry(msg.channel_id).or_insert(0) += 1;
+            // Real notification: toast + desktop banner with sound hint.
+            let channel = self
+                .channel_by_id(msg.channel_id)
+                .map(|c| c.display_name())
+                .unwrap_or_else(|| "unknown".into());
+            let author = msg.author.display_name().to_string();
+            let snippet: String = msg
+                .content
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(48)
+                .collect();
+            crate::notify::mention(&author, &channel, &snippet);
         }
     }
 
@@ -474,6 +527,174 @@ impl AppState {
     }
     pub fn pins_for(&self, channel_id: Snowflake) -> Vec<Message> {
         self.pins.read().get(&channel_id).cloned().unwrap_or_default()
+    }
+
+    // ── v0.2: pins-unread / send lock / presence / voice / emoji / misc ──
+
+    /// Mark "this channel got new pinned content" (red dot on pins button).
+    pub fn pin_updated(&self, channel_id: Snowflake) {
+        self.pins_unread.write().insert(channel_id);
+    }
+    pub fn pins_unread(&self, channel_id: Snowflake) -> bool {
+        self.pins_unread.read().contains(&channel_id)
+    }
+    pub fn clear_pins_unread(&self, channel_id: Snowflake) {
+        self.pins_unread.write().remove(&channel_id);
+    }
+
+    /// Halt all outbound sends (Discord blocked us). Never auto-cleared.
+    pub fn lock_sends(&self, reason: String) {
+        let mut lock = self.send_lock.write();
+        if lock.is_none() {
+            tracing::error!(reason = %reason, "send lock engaged");
+        }
+        *lock = Some(reason);
+    }
+    pub fn send_lock_reason(&self) -> Option<String> {
+        self.send_lock.read().clone()
+    }
+    /// User-authorized unlock (the Retry button in the composer banner).
+    pub fn clear_send_lock(&self) {
+        *self.send_lock.write() = None;
+    }
+
+    /// Full presence (status + activities), stored from PRESENCE_UPDATE.
+    pub fn set_presence_full(&self, p: &crate::model::PresenceUpdate) {
+        self.presences.write().insert(p.user.id, p.status.clone());
+        self.presence_full
+            .write()
+            .insert(p.user.id, p.clone());
+    }
+    pub fn presence_full(&self, user_id: Snowflake) -> Option<crate::model::PresenceUpdate> {
+        self.presence_full.read().get(&user_id).cloned()
+    }
+    /// First activity line for a user ("Playing Rust", "Listening Spotify").
+    pub fn activity_line(&self, user_id: Snowflake) -> Option<String> {
+        let p = self.presence_full.read().get(&user_id)?.clone();
+        let a = p.activities.first()?;
+        let label = match a.kind {
+            0 => Some(format!("Playing {}", a.name)).or(a.details.clone()),
+            1 => a.details.clone().or(Some(a.name.clone())),
+            2 => a
+                .details
+                .clone()
+                .or(Some(format!("Listening to {}", a.name))),
+            3 => Some(format!("Watching {}", a.name)).or(a.details.clone()),
+            4 => a.state.clone().or(a.details.clone()),
+            5 => Some(format!("Competing in {}", a.name)).or(a.details.clone()),
+            _ => a.details.clone(),
+        }?;
+        Some(label)
+    }
+
+    /// Voice states: guild_id -> (user_id -> channel_id). `None` = left.
+    pub fn apply_voice_state(&self, guild_id: Snowflake, user_id: Snowflake, channel_id: Option<Snowflake>) {
+        let mut vs = self.voice_states.write();
+        let guild = vs.entry(guild_id).or_default();
+        match channel_id {
+            Some(cid) => {
+                guild.insert(user_id, Some(cid));
+            }
+            None => {
+                guild.remove(&user_id);
+            }
+        }
+    }
+    /// Users connected to a voice channel (sidebar mini rows).
+    pub fn voice_channel_users(&self, guild_id: Snowflake, channel_id: Snowflake) -> Vec<Snowflake> {
+        self.voice_states
+            .read()
+            .get(&guild_id)
+            .map(|g| {
+                g.iter()
+                    .filter(|(_, cid)| **cid == Some(channel_id))
+                    .map(|(uid, _)| *uid)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn user_voice_channel(&self, guild_id: Snowflake, user_id: Snowflake) -> Option<Snowflake> {
+        self.voice_states
+            .read()
+            .get(&guild_id)
+            .and_then(|g| g.get(&user_id).copied().flatten())
+    }
+
+    /// Custom emoji of a guild (picker + jumbo rendering).
+    pub fn set_guild_emojis(&self, guild_id: Snowflake, emojis: Vec<crate::model::Emoji>) {
+        self.guild_emojis.write().insert(guild_id, emojis);
+    }
+    pub fn guild_emojis(&self, guild_id: Snowflake) -> Vec<crate::model::Emoji> {
+        self.guild_emojis
+            .read()
+            .get(&guild_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Out-of-band fetched replied-to message (reply reference rendering).
+    pub fn set_referenced_message(&self, m: &Message) {
+        self.referenced_messages.write().insert(m.id, m.clone());
+    }
+    pub fn referenced_message(&self, id: Snowflake) -> Option<Message> {
+        self.referenced_messages.read().get(&id).cloned()
+    }
+
+    /// YouTube oEmbed cache.
+    pub fn set_oembed(&self, url: &str, info: crate::model::OEmbedInfo) {
+        self.oembed.write().insert(url.to_string(), info);
+    }
+    pub fn oembed(&self, url: &str) -> Option<crate::model::OEmbedInfo> {
+        self.oembed.read().get(url).cloned()
+    }
+
+    /// Fetched profile (bio/pronouns) for the popup card.
+    pub fn set_profile(&self, user_id: Snowflake, p: crate::model::UserProfile) {
+        self.profiles.write().insert(user_id, p);
+    }
+    pub fn profile(&self, user_id: Snowflake) -> Option<crate::model::UserProfile> {
+        self.profiles.read().get(&user_id).cloned()
+    }
+
+    /// Scheduled events per guild (sidebar Events popup).
+    pub fn set_events(&self, guild_id: Snowflake, events: Vec<crate::model::ScheduledEvent>) {
+        self.events.write().insert(guild_id, events);
+    }
+    pub fn events_for(&self, guild_id: Snowflake) -> Vec<crate::model::ScheduledEvent> {
+        self.events.read().get(&guild_id).cloned().unwrap_or_default()
+    }
+
+    /// Pinned DMs (session mirror of config.pinned_dms).
+    pub fn set_pinned_dm(&self, id: Snowflake, pinned: bool) {
+        if pinned {
+            self.pinned_dms.write().insert(id);
+        } else {
+            self.pinned_dms.write().remove(&id);
+        }
+    }
+    pub fn pinned_dm(&self, id: Snowflake) -> bool {
+        self.pinned_dms.read().contains(&id)
+    }
+    pub fn set_relationships_len(&self, n: usize) {
+        *self.relationships_len.write() = Some(n);
+    }
+    pub fn relationships_len(&self) -> usize {
+        self.relationships_len.read().unwrap_or(0)
+    }
+    pub fn set_relationships_unavailable(&self, reason: String) {
+        *self.relationships_len.write() = Some(0);
+        *self.relationships_unavailable.write() = Some(reason);
+    }
+    pub fn relationships_unavailable(&self) -> Option<String> {
+        self.relationships_unavailable.read().clone()
+    }
+    pub fn init_pinned_dms(&self, ids: &[String]) {
+        let mut set = self.pinned_dms.write();
+        for id in ids {
+            if let Ok(v) = id.parse::<u64>() {
+                set.insert(Snowflake::from_u64(v));
+            }
+        }
     }
 
     // ── Typing ──
@@ -556,7 +777,11 @@ impl AppState {
                     self.guild_members.write().insert(d.id, member_ids);
                 }
                 for p in &d.presences {
-                    self.set_presence(p.user.id, &p.status);
+                    self.set_presence_full(p);
+                }
+                // Custom emoji for the picker (GUILD_CREATE carries them).
+                if !d.emojis.is_empty() {
+                    self.set_guild_emojis(d.id, d.emojis.clone());
                 }
             }
             Event::GuildMembersChunk { d } => {
@@ -576,7 +801,7 @@ impl AppState {
                     self.guild_members.write().insert(d.guild_id, ids);
                 }
                 for p in &d.presences {
-                    self.set_presence(p.user.id, &p.status);
+                    self.set_presence_full(p);
                 }
                 if d.chunk_index + 1 >= d.chunk_count.max(1) {
                     tracing::debug!(guild = %d.guild_id, "member list complete");
@@ -712,7 +937,7 @@ impl AppState {
                 self.set_typing(d.channel_id, d.user_id, &name);
             }
             Event::PresenceUpdate { d } => {
-                self.set_presence(d.user.id, &d.status);
+                self.set_presence_full(d);
                 // Only cache the user record if the payload is complete.
                 if let Some(name) = d.user.display_name() {
                     let u = crate::model::User {
@@ -733,12 +958,50 @@ impl AppState {
                     g[idx] = d.clone();
                 }
             }
-            Event::ChannelPinsUpdate { d: _ } => {}
+            Event::ChannelPinsUpdate { d } => {
+                // Red dot on the header pins button for this channel.
+                if let Some(cid) = d["channel_id"].as_str().and_then(|s| s.parse::<u64>().ok()) {
+                    self.pin_updated(Snowflake::from_u64(cid));
+                    // Refresh the pins cache too so the popup shows the new pin.
+                    if let Some(rest) = crate::rest::global() {
+                        let cid = Snowflake::from_u64(cid);
+                        tokio::spawn(async move {
+                            if let Ok(pins) = rest.get_channel_pins(cid).await {
+                                if let Some(s) = crate::state::global() {
+                                    s.set_pins(cid, pins);
+                                    s.event_sender()
+                                        .send(crate::gateway::events::Event::RepaintRequested)
+                                        .ok();
+                                }
+                            }
+                        });
+                    }
+                }
+            }
             Event::MessageReactionAdd { d } => self.apply_reaction(d, true),
             Event::MessageReactionRemove { d } => self.apply_reaction(d, false),
             Event::MessageReactionRemoveAll { d: _ } => {}
             Event::MessageReactionRemoveEmoji { d: _ } => {}
-            Event::VoiceStateUpdate { d: _ } => {}
+            Event::VoiceStateUpdate { d } => {
+                if let Some(gid) = d.guild_id {
+                    self.apply_voice_state(gid, d.user_id, d.channel_id);
+                    if let Some(u) = self.user(d.user_id) {
+                        self.touch_user(&u);
+                    }
+                }
+            }
+            Event::GuildEmojisUpdate { d } => {
+                // {guild_id, emojis: [...]}
+                let gid = d["guild_id"].as_str().and_then(|s| s.parse::<u64>().ok());
+                let emojis = d["emojis"].as_array().cloned().unwrap_or_default();
+                if let Some(gid) = gid {
+                    let parsed: Vec<crate::model::Emoji> = emojis
+                        .iter()
+                        .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                        .collect();
+                    self.set_guild_emojis(Snowflake::from_u64(gid), parsed);
+                }
+            }
             Event::VoiceServerUpdate { d: _ } => {}
             Event::UserUpdate { d } => {
                 *self.current_user.write() = Some(d.clone());

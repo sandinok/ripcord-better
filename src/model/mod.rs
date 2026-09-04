@@ -86,6 +86,22 @@ impl User {
         let bucket = (u64::from(self.id) >> 22) % 6;
         format!("https://cdn.discordapp.com/embed/avatars/{}.png?size=128", bucket)
     }
+
+    /// Profile banner URL (user-level banner), when the user has one.
+    pub fn banner_url(&self) -> Option<String> {
+        let h = self.banner.as_deref()?;
+        let ext = if h.starts_with("a_") { "gif" } else { "webp" };
+        Some(format!("https://cdn.discordapp.com/banners/{}/{}.{}?size=600", self.id, h, ext))
+    }
+
+    /// Accent color as an egui color (for banners we render as gradient).
+    pub fn accent(&self) -> Option<egui::Color32> {
+        self.accent_color.map(|c| egui::Color32::from_rgb(
+            ((c >> 16) & 0xFF) as u8,
+            ((c >> 8) & 0xFF) as u8,
+            (c & 0xFF) as u8,
+        ))
+    }
 }
 
 // ───────────────────────────── Guilds ─────────────────────────────
@@ -124,6 +140,10 @@ pub struct Guild {
     /// Latest role icon (if shipped). Real roles come from GUILD_CREATE payload.
     #[serde(default)]
     pub roles: Vec<Role>,
+    #[serde(default)]
+    pub emojis: Vec<Emoji>,
+    #[serde(default)]
+    pub stickers: Vec<StickerItem>,
     /// Channels - only present in GUILD_CREATE (full payload), not in
     /// READY's guild stubs or REST guild list responses.
     #[serde(default)]
@@ -365,6 +385,9 @@ pub struct Message {
     /// Reply reference (for type 19 = REPLY). Contains the referenced message id.
     #[serde(default)]
     pub message_reference: Option<MessageReference>,
+    /// Stickers attached to this message.
+    #[serde(default)]
+    pub sticker_items: Vec<StickerItem>,
     #[serde(default)]
     pub referenced_message: Option<Box<Message>>,
     /// Client nonce echoed back on MESSAGE_CREATE. Discord sends this as
@@ -830,4 +853,106 @@ pub struct TypingStart {
     pub guild_id: Option<Snowflake>,
     #[serde(default)]
     pub member: Option<Member>,
+}
+
+// ───────────────────────────── v0.2 additions ─────────────────────────────
+
+/// A custom guild emoji.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Emoji {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub animated: bool,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub available: bool,
+}
+
+impl Emoji {
+    /// CDN URL for this emoji.
+    pub fn url(&self) -> String {
+        let ext = if self.animated { "gif" } else { "png" };
+        format!("https://cdn.discordapp.com/emojis/{}.{}", self.id, ext)
+    }
+    /// The `<:name:id>` / `<a:name:id>` mention form used in message content.
+    pub fn mention(&self) -> String {
+        if self.animated {
+            format!("<a:{}:{}>", self.name, self.id)
+        } else {
+            format!("<:{}:{}>", self.name, self.id)
+        }
+    }
+}
+
+/// YouTube oEmbed metadata (no API key required).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OEmbedInfo {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub author_name: Option<String>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+}
+
+/// A sticker attached to a message (`sticker_items`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StickerItem {
+    pub id: Snowflake,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// 1 = PNG, 2 = APNG, 3 = Lottie, 4 = GIF.
+    #[serde(default)]
+    pub format_type: u8,
+}
+
+impl StickerItem {
+    pub fn url(&self) -> String {
+        let ext = match self.format_type {
+            3 => "json",
+            4 => "gif",
+            _ => "png",
+        };
+        format!("https://cdn.discordapp.com/stickers/{}.{}", self.id, ext)
+    }
+}
+
+/// User profile extras (bio, pronouns) from GET /users/{id}/profile.
+/// Bot tokens can read this for other bots and for members of their
+/// guilds; when Discord refuses we degrade to the plain user object.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserProfile {
+    #[serde(default)]
+    pub bio: Option<String>,
+    #[serde(default)]
+    pub pronouns: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub accent_color: Option<u32>,
+    #[serde(default)]
+    pub premium_type: Option<u8>,
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
+/// A guild scheduled event (sidebar Events popup).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScheduledEvent {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub status: u8,
+    #[serde(default)]
+    pub start: Option<String>,
+    #[serde(default)]
+    pub end: Option<String>,
+    #[serde(default)]
+    pub user_count: Option<u32>,
 }

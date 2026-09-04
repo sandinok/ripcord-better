@@ -14,6 +14,11 @@ pub struct Args {
     pub print_version: bool,
     /// Verbose logging (`-vv` for trace).
     pub verbose: u8,
+    /// Launched by the updater swap: verify the new version, clean the
+    /// backup, show the "updated" toast.
+    pub post_update: bool,
+    /// Launched from the restored backup: clean up the failed-update trail.
+    pub update_failed: bool,
 }
 
 pub fn parse() -> Result<Args, String> {
@@ -51,6 +56,8 @@ pub fn parse() -> Result<Args, String> {
             other if other.starts_with("--config=") => {
                 a.config = Some(PathBuf::from(other.trim_start_matches("--config=")));
             }
+            "--post-update" => a.post_update = true,
+            "--update-failed" => a.update_failed = true,
             other => {
                 return Err(format!("unknown argument: {other}"));
             }

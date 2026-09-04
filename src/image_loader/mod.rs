@@ -18,6 +18,7 @@
 //!      the session ("Connection lost - reconnecting").
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{ColorImage, Context, Painter, Pos2, Rect, Sense, TextureHandle, TextureOptions, Ui, Vec2};
@@ -42,6 +43,151 @@ static IMAGE_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
 
 pub fn global_cache() -> &'static ImageCache {
     &GLOBAL_CACHE
+}
+
+/// A decoded animated GIF: frames as textures + per-frame delays.
+/// Rendered by `render_animated_image` (server icons animate on hover).
+pub struct AnimatedImage {
+    frames: Vec<TextureHandle>,
+    delays: Vec<Duration>,
+    total: Duration,
+}
+
+impl AnimatedImage {
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+    /// Frame for time `t` since animation start, plus remaining time of it.
+    fn frame_at(&self, t: Duration) -> (usize, Duration) {
+        if self.frames.is_empty() {
+            return (0, Duration::from_millis(100));
+        }
+        let cycle = self.total.max(Duration::from_millis(1));
+        let mut t = (t.as_nanos() % cycle.as_nanos()) as u64;
+        for (i, d) in self.delays.iter().enumerate() {
+            let d = (*d).max(Duration::from_millis(20));
+            if t < d.as_millis() as u64 {
+                return (i, d - Duration::from_millis(t));
+            }
+            t -= d.as_millis() as u64;
+        }
+        (self.frames.len() - 1, Duration::from_millis(100))
+    }
+}
+
+static ANIMATED_CACHE: Lazy<Mutex<HashMap<String, Arc<AnimatedImage>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static ANIMATED_INFLIGHT: Lazy<Mutex<std::collections::HashSet<String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Fetch + decode an animated GIF. `None` while loading or when the URL
+/// is not an animated GIF.
+pub fn get_or_fetch_animated(ctx: &Context, url: &str, max_px: u32) -> Option<Arc<AnimatedImage>> {
+    if let Some(a) = ANIMATED_CACHE.lock().get(url) {
+        return Some(a.clone());
+    }
+    let should_spawn = ANIMATED_INFLIGHT.lock().insert(url.to_string());
+    if should_spawn {
+        let ctx = ctx.clone();
+        let url = url.to_string();
+        let max_px = max_px.max(16);
+        tokio::spawn(async move {
+            if let Some(anim) = fetch_animated(&ctx, &url, max_px).await {
+                ANIMATED_CACHE.lock().insert(url.clone(), anim);
+            }
+            ANIMATED_INFLIGHT.lock().remove(&url);
+        });
+    }
+    None
+}
+
+async fn fetch_animated(ctx: &Context, url: &str, max_px: u32) -> Option<Arc<AnimatedImage>> {
+    let bytes = IMAGE_HTTP
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .bytes()
+        .await
+        .ok()?
+        .to_vec();
+    if !bytes.starts_with(b"GIF8") {
+        return None; // only GIFs are animated here
+    }
+    let ctx2 = ctx.clone();
+    let frames = tokio::task::spawn_blocking(move || decode_gif_frames(&ctx2, &bytes, max_px))
+        .await
+        .ok()??;
+    let delays: Vec<Duration> = frames.iter().map(|(_, d)| *d).collect();
+    let total: Duration = delays.iter().sum();
+    let textures: Vec<TextureHandle> = frames
+        .into_iter()
+        .map(|(img, _)| ctx.load_texture(format!("{url}#anim{}", rand_hint()), ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img), TextureOptions::LINEAR))
+        .collect();
+    Some(Arc::new(AnimatedImage { frames: textures, delays, total }))
+}
+
+fn rand_hint() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    Instant::now().hash(&mut h);
+    h.finish()
+}
+
+fn decode_gif_frames(_ctx: &Context, bytes: &[u8], max_px: u32) -> Option<Vec<(image::RgbaImage, Duration)>> {
+    use image::AnimationDecoder as _;
+    let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut out = Vec::new();
+    for frame in decoder.into_frames() {
+        let frame = frame.ok()?;
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay = Duration::from_millis((numer as f64 / denom.max(1) as f64).ceil() as u64);
+        let mut img = frame.into_buffer();
+        let (w, h) = img.dimensions();
+        if w > max_px || h > max_px {
+            let scale = max_px as f32 / w.max(h) as f32;
+            let (tw, th) = ((w as f32 * scale).round() as u32, (h as f32 * scale).round() as u32);
+            img = image::imageops::resize(&img, tw.max(1), th.max(1), image::imageops::FilterType::Triangle);
+        }
+        out.push((img, delay));
+    }
+    if out.len() < 2 {
+        return None; // single-frame or failed: not animated
+    }
+    Some(out)
+}
+
+/// Render an animated GIF in a `size` rect. `playing` = animate (hover);
+/// otherwise the first frame shows. Corner radius follows `shape`.
+pub fn render_animated_image(ui: &mut Ui, url: &str, size: Vec2, shape: Shape, playing: bool) {
+    let ctx = ui.ctx().clone();
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if let Some(anim) = get_or_fetch_animated(&ctx, url, (size.x.max(size.y) * 2.0) as u32) {
+        let start_id = egui::Id::new("anim_start").with(url);
+        let start = match ui.ctx().data(|d| d.get_temp::<Instant>(start_id)) {
+            Some(t) => t,
+            None => {
+                let now = Instant::now();
+                ui.ctx().data_mut(|d| d.insert_temp(start_id, now));
+                now
+            }
+        };
+        let elapsed = start.elapsed();
+        let (idx, remaining) = anim.frame_at(elapsed);
+        let idx = if playing { idx } else { 0 };
+        if playing {
+            ui.ctx().request_repaint_after(remaining.max(Duration::from_millis(30)));
+        }
+        if let Some(handle) = anim.frames.get(idx).or(anim.frames.first()) {
+            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+            let painter = ui.painter_at(rect);
+            painter.image(handle.id(), rect, uv, egui::Color32::WHITE);
+        }
+    } else {
+        ui.painter_at(rect).rect_filled(rect, corner_radius_for(shape, size.min_elem()), egui::Color32::from_rgb(0x38, 0x3A, 0x40));
+    }
 }
 
 /// How long a failed fetch is remembered before allowing a retry.
@@ -130,6 +276,13 @@ impl ImageCache {
             });
         }
         None
+    }
+
+    /// Drop every cached texture (settings: clear image cache).
+    pub fn clear_all(&self) {
+        self.inner.lock().clear();
+        self.failed.lock().clear();
+        ANIMATED_CACHE.lock().clear();
     }
 
     pub fn stats(&self) -> (usize, usize) {
@@ -341,6 +494,30 @@ pub fn render_image_size(ui: &mut Ui, url: &str, size: Vec2, shape: Shape) {
         let r = corner_radius_for(shape, size.min_elem());
         painter.rect_filled(rect, r, egui::Color32::from_rgb(0x38, 0x3A, 0x40));
     }
+}
+
+/// A clickable custom-emoji cell for picker grids: returns true when
+/// clicked. Allocates its own rect; falls back to text while loading.
+pub fn render_emoji_cell(ui: &mut Ui, url: &str, size: f32, name: &str) -> bool {
+    let cache = global_cache();
+    let ctx = ui.ctx().clone();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!(":{name}:"));
+    if let Some(handle) = cache.get_or_fetch(&ctx, url, (size * 2.0) as u32, (size * 2.0) as u32, Shape::Square) {
+        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        ui.painter_at(rect).image(handle.id(), rect, uv, egui::Color32::WHITE);
+    } else {
+        ui.painter_at(rect).text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!(":{name}:"),
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_rgb(0xB5, 0xBA, 0xC1),
+        );
+    }
+    resp.clicked()
 }
 
 /// Render a custom Discord emoji (`<:name:id>`) inline at `size` px,

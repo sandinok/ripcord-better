@@ -9,8 +9,11 @@
 #![allow(dead_code)]
 
 pub mod chat;
+pub mod toast;
+pub mod youtube;
 pub mod emoji;
 pub mod guilds_bar;
+pub mod home;
 pub mod login;
 pub mod members;
 pub mod scroll;

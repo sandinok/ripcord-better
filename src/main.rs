@@ -32,10 +32,13 @@ mod icons_data;
 mod image_loader;
 mod markdown;
 mod model;
+mod notify;
 mod rest;
+mod scrub;
 mod sender;
 mod state;
 mod ui;
+mod updater;
 
 use std::process::ExitCode;
 
@@ -57,6 +60,8 @@ fn main() -> ExitCode {
     // logging. Quiet by default: a GUI app talks through its window, not
     // through the terminal. RUST_LOG always wins if the user sets it.
     init_logging(args.verbose);
+    // Every panic line goes through the redactor too (point 3).
+    scrub::install_panic_hook();
 
     if args.print_version {
         println!(
@@ -69,7 +74,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let cfg = match config::Config::load(&args) {
+    let mut cfg = match config::Config::load(&args) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "failed to load config");
@@ -77,6 +82,21 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
+
+    // Updater lifecycle: --post-update verifies the swap and cleans the
+    // backup; --update-failed restores the old binary's trail; a stale
+    // marker from an update that never started is tidied up too.
+    if args.post_update {
+        if let Some(msg) = updater::post_update_check() {
+            cfg.startup_notice = Some(msg);
+        }
+    } else if args.update_failed {
+        if let Some(msg) = updater::cleanup_stale_update() {
+            cfg.startup_notice = Some(msg);
+        }
+    } else if let Some(msg) = updater::cleanup_stale_update() {
+        cfg.startup_notice = Some(msg);
+    }
 
     // Two async workers: one is enough for REST, but the gateway heartbeats
     // must never queue behind a busy worker (a stalled heartbeat is how
@@ -143,6 +163,9 @@ fn rustc_version() -> &'static str {
 
 /// Set up `tracing`. Level ladder: default `warn`, `-v` info, `-vv` trace.
 /// `RUST_LOG` (if exported by the user) overrides everything.
+///
+/// Every event is formatted through [`scrub::ScrubbedFormatter`] so no
+/// token-shaped string ever reaches stderr.
 fn init_logging(verbosity: u8) {
     let level = match verbosity {
         0 => "warn",
@@ -153,7 +176,12 @@ fn init_logging(verbosity: u8) {
         .unwrap_or_else(|_| EnvFilter::new(format!("{level},hyper=warn,reqwest=warn,tungstenite=warn")));
     tracing_subscriber::registry()
         .with(env)
-        .with(fmt::layer().with_target(false).with_thread_ids(false))
+        .with(
+            fmt::layer()
+                .with_target(false)
+                .with_thread_ids(false)
+                .event_format(scrub::ScrubbedFormatter),
+        )
         .init();
 }
 

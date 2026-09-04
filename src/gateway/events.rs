@@ -45,6 +45,7 @@ pub enum Event {
     TypingStart { d: TypingStart },
     PresenceUpdate { d: PresenceUpdate },
     VoiceStateUpdate { d: VoiceState },
+    GuildEmojisUpdate { d: Value },
     VoiceServerUpdate { d: VoiceServerUpdate },
     UserUpdate { d: crate::model::User },
     /// INTERNAL (never arrives from the wire): the UI wants to change the
@@ -244,6 +245,7 @@ pub fn parse_dispatch(event_name: &str, d: Value) -> Event {
             Ok(u) => Event::UserUpdate { d: u },
             Err(_) => Event::Unknown { name: "USER_UPDATE".into(), d },
         },
+        "GUILD_EMOJIS_UPDATE" => Event::GuildEmojisUpdate { d },
         other => Event::Unknown { name: other.into(), d },
     }
 }

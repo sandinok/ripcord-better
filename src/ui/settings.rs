@@ -17,14 +17,33 @@ pub enum Section {
     Account,
     Appearance,
     Notifications,
+    Behavior,
+    Advanced,
     About,
 }
+
+/// All nav sections with their icon + label (the search filters these).
+const NAV_ITEMS: [(Section, &str, &str); 6] = [
+    (Section::Account, "account_circle", "My Account"),
+    (Section::Appearance, "palette", "Appearance"),
+    (Section::Notifications, "notifications", "Notifications"),
+    (Section::Behavior, "bolt", "Behavior"),
+    (Section::Advanced, "memory", "Advanced"),
+    (Section::About, "help", "About"),
+];
 
 pub struct SettingsState {
     pub open: bool,
     pub section: Section,
     /// 0..=1 entrance animation progress.
     pub enter: f32,
+    /// Live filter of the settings nav.
+    pub nav_search: String,
+    /// Updater: latest release found (from the last check).
+    pub update_info: Option<crate::updater::UpdateInfo>,
+    /// Updater: live phase while downloading / installing.
+    pub update_phase: Option<crate::updater::UpdatePhase>,
+    pub update_checked: bool,
 }
 
 impl Default for SettingsState {
@@ -33,6 +52,10 @@ impl Default for SettingsState {
             open: false,
             section: Section::Account,
             enter: 0.0,
+            nav_search: String::new(),
+            update_info: None,
+            update_phase: None,
+            update_checked: false,
         }
     }
 }
@@ -129,21 +152,69 @@ pub fn render(
 
     crate::ui::allocate_ui_at_rect(ui, nav_rect, |ui| {
         ui.set_min_width(ui.available_width());
-        ui.add_space(16.0);
+        ui.add_space(12.0);
+        // Avatar header + Edit Profile (opens your own profile card).
         ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new("User Settings")
-                    .size(15.0)
-                    .strong()
-                    .color(colors::TEXT_HEADER),
+            ui.add_space(14.0);
+            if let Some(u) = shared.current_user() {
+                crate::image_loader::render_avatar(ui, &u.avatar_url(), 40.0, u.display_name(), Some(&shared.own_status()));
+            }
+            ui.vertical(|ui| {
+                if let Some(u) = shared.current_user() {
+                    ui.label(
+                        egui::RichText::new(u.display_name())
+                            .size(13.5)
+                            .strong()
+                            .color(colors::TEXT_HEADER),
+                    );
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(86.0, 22.0), Sense::click());
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let p = ui.painter_at(r);
+                    p.rect_filled(r, 11.0, colors::BG_INPUT);
+                    p.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Edit Profile",
+                        egui::FontId::proportional(11.0),
+                        colors::TEXT_PRIMARY,
+                    );
+                    if resp.clicked() {
+                        if let Some(u) = shared.current_user() {
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(
+                                    egui::Id::new(crate::ui::members::CARD_USER_ID),
+                                    u.id,
+                                )
+                            });
+                        }
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("Not signed in")
+                            .size(13.0)
+                            .color(colors::TEXT_TERTIARY),
+                    );
+                }
+            });
+        });
+        ui.add_space(10.0);
+        // Search the settings nav (Discord's settings search).
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut settings.nav_search)
+                    .desired_width(nav_w - 24.0)
+                    .hint_text("Search settings")
+                    .font(egui::FontId::proportional(12.5)),
             );
         });
-        ui.add_space(12.0);
-        nav_item(ui, settings, Section::Account, "account_circle", "My Account");
-        nav_item(ui, settings, Section::Appearance, "palette", "Appearance");
-        nav_item(ui, settings, Section::Notifications, "notifications", "Notifications");
-        nav_item(ui, settings, Section::About, "help", "About");
+        ui.add_space(8.0);
+        let needle = settings.nav_search.trim().to_lowercase();
+        for (section, icon, label) in NAV_ITEMS {
+            if needle.is_empty() || label.to_lowercase().contains(&needle) {
+                nav_item(ui, settings, section, icon, label);
+            }
+        }
 
         // Pin the close button to the bottom of the card.
         let x_rect = egui::Rect::from_min_size(
@@ -174,6 +245,8 @@ pub fn render(
                     Section::Account => account_section(ui, shared, gateway_tx, &mut sign_out),
                     Section::Appearance => appearance_section(ui, config),
                     Section::Notifications => notifications_section(ui, config),
+                    Section::Behavior => behavior_section(ui, config),
+                    Section::Advanced => advanced_section(ui, config, settings),
                     Section::About => about_section(ui),
                 }
                 ui.add_space(20.0);
@@ -184,7 +257,7 @@ pub fn render(
 }
 
 fn nav_item(ui: &mut Ui, settings: &mut SettingsState, section: Section, icon: &str, label: &str) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
     let resp = resp
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(label);
@@ -410,9 +483,9 @@ fn notifications_section(ui: &mut Ui, config: &mut Config) {
 
     ui.label(
         egui::RichText::new(
-            "Basalt keeps notifications inside the app: unread dots and mention \
-             badges on channels and servers, plus a mention counter in the window \
-             title. No system tray, no sounds, nothing leaves your machine.",
+            "Basalt keeps notifications inside the app: unread dots, mention \
+             badges on channels and servers, a mention counter in the window \
+             title, and in-app toast banners. Nothing leaves your machine.",
         )
         .size(13.0)
         .color(colors::TEXT_TERTIARY),
@@ -431,6 +504,304 @@ fn notifications_section(ui: &mut Ui, config: &mut Config) {
         config.title_mentions = title;
         let _ = config.save();
     }
+    let mut sounds = config.notification_sounds;
+    toggle_row(ui, "Play a sound when you are mentioned", &mut sounds);
+    if sounds != config.notification_sounds {
+        config.notification_sounds = sounds;
+        let _ = config.save();
+    }
+    let mut desktop = config.desktop_notifications;
+    toggle_row(ui, "Show in-app toast banners for mentions", &mut desktop);
+    if desktop != config.desktop_notifications {
+        config.desktop_notifications = desktop;
+        let _ = config.save();
+    }
+
+    ui.add_space(10.0);
+    sub_title(ui, "Preview");
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(150.0, 30.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let p = ui.painter_at(r);
+    p.rect_filled(r, 6.0, colors::BLURPLE);
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        "Send a test toast",
+        egui::FontId::proportional(12.5),
+        colors::TEXT_PRIMARY,
+    );
+    if resp.clicked() {
+        crate::ui::toast::info("This is what a mention banner looks like.");
+    }
+}
+
+fn behavior_section(ui: &mut Ui, config: &mut Config) {
+    section_title(ui, "Behavior");
+
+    let mut enter = config.enter_to_send;
+    toggle_row(ui, "Pressing Enter sends the message", &mut enter);
+    if enter != config.enter_to_send {
+        config.enter_to_send = enter;
+        let _ = config.save();
+    }
+    ui.label(
+        egui::RichText::new(
+            "On: Enter sends, like Discord's default.\n             Off: Enter makes a newline; Ctrl+Enter sends.",
+        )
+        .size(12.0)
+        .color(colors::TEXT_TERTIARY),
+    );
+
+    ui.add_space(14.0);
+    sub_title(ui, "Keyboard");
+    ui.label(
+        egui::RichText::new("Ctrl+M toggles the member list. Escape closes popups.")
+            .size(12.5)
+            .color(colors::TEXT_SECONDARY),
+    );
+}
+
+fn advanced_section(ui: &mut Ui, config: &mut Config, settings: &mut SettingsState) {
+    section_title(ui, "Advanced");
+
+    sub_title(ui, "Image cache");
+    let (loaded, inflight) = crate::image_loader::global_cache().stats();
+    ui.label(
+        egui::RichText::new(format!(
+            "{} images cached in memory ({} loading right now).",
+            loaded, inflight
+        ))
+        .size(12.5)
+        .color(colors::TEXT_SECONDARY),
+    );
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(150.0, 30.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let p = ui.painter_at(r);
+    p.rect_filled(r, 6.0, colors::RED.gamma_multiply(0.8));
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        "Clear image cache",
+        egui::FontId::proportional(12.5),
+        colors::TEXT_PRIMARY,
+    );
+    if resp.clicked() {
+        crate::image_loader::global_cache().clear_all();
+        crate::ui::toast::success("Image cache cleared. Avatars and icons reload as needed.");
+    }
+
+    ui.add_space(14.0);
+    sub_title(ui, "Updates");
+    let mut auto = config.auto_updates;
+    toggle_row(ui, "Check for updates on startup", &mut auto);
+    if auto != config.auto_updates {
+        config.auto_updates = auto;
+        let _ = config.save();
+    }
+
+    // Check now / install flow (real GitHub release check).
+    let busy = settings.update_phase.is_some();
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(170.0, 30.0), Sense::click());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_disabled_hover_text("Checking...");
+    let p = ui.painter_at(r);
+    p.rect_filled(r, 6.0, if busy { colors::BG_ACCENT } else { colors::BLURPLE });
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        if busy { "Working..." } else { "Check for updates" },
+        egui::FontId::proportional(12.5),
+        colors::TEXT_PRIMARY,
+    );
+    if resp.clicked() && !busy {
+        settings.update_checked = true;
+        // Store the phase in egui data so the spawned task can report.
+        let ctx = ui.ctx().clone();
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("update_phase"),
+                crate::updater::UpdatePhase::Verifying,
+            )
+        });
+        tokio::spawn(async move {
+            let found = match crate::updater::check().await {
+                Ok(info) => info,
+                Err(e) => {
+                    ctx.data_mut(|d| {
+                        d.insert_temp(
+                            egui::Id::new("update_phase"),
+                            crate::updater::UpdatePhase::Failed(format!("{e}")),
+                        )
+                    });
+                    return;
+                }
+            };
+            match found {
+                Some(info) => {
+                    // Store the pending update; the button switches to
+                    // "Download and restart".
+                    ctx.data_mut(|d| {
+                        d.insert_temp(egui::Id::new("update_info"), info);
+                        d.insert_temp(
+                            egui::Id::new("update_phase"),
+                            crate::updater::UpdatePhase::Failed(String::new()),
+                        );
+                    });
+                }
+                None => {
+                    ctx.data_mut(|d| {
+                        d.insert_temp(
+                            egui::Id::new("update_phase"),
+                            crate::updater::UpdatePhase::Failed("You are up to date.".into()),
+                        )
+                    });
+                }
+            }
+        });
+    }
+
+    // Poll the shared phase/info back into SettingsState for rendering.
+    if let Some(phase) = ui.ctx().data(|d| {
+        d.get_temp::<crate::updater::UpdatePhase>(egui::Id::new("update_phase"))
+    }) {
+        // Empty-Failed is the "clear" marker after an update was found.
+        if matches!(&phase, crate::updater::UpdatePhase::Failed(m) if m.is_empty()) {
+            settings.update_phase = None;
+        } else {
+            settings.update_phase = Some(phase.clone());
+            if let crate::updater::UpdatePhase::Failed(msg) = &phase {
+                ui.label(
+                    egui::RichText::new(msg.clone())
+                        .size(12.5)
+                        .color(if msg.contains("up to date") { colors::STATUS_ONLINE } else { colors::RED }),
+                );
+            }
+        }
+    }
+    if let Some(info) = ui
+        .ctx()
+        .data(|d| d.get_temp::<crate::updater::UpdateInfo>(egui::Id::new("update_info")))
+    {
+        settings.update_info = Some(info);
+    }
+    // A found update renders as a card with the download button.
+    if let Some(info) = settings.update_info.clone() {
+        ui.add_space(6.0);
+        let frame = egui::Frame::new()
+            .fill(colors::BG_SECONDARY_ALT)
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::same(12));
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(format!("Basalt v{} is available", info.version))
+                    .size(14.0)
+                    .strong()
+                    .color(colors::TEXT_PRIMARY),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "Downloads from github.com/{}/releases - checksum-verified, with rollback.",
+                    crate::updater::REPO
+                ))
+                .size(12.0)
+                .color(colors::TEXT_TERTIARY),
+            );
+            // Progress bar while downloading.
+            if let Some(crate::updater::UpdatePhase::Downloading { done, total }) = &settings.update_phase
+            {
+                let frac = (*done as f32 / (*total as f32).max(1.0)).clamp(0.0, 1.0);
+                let bar_w = ui.available_width();
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, 12.0), Sense::hover());
+                let p = ui.painter_at(rect);
+                p.rect_filled(rect, 6.0, colors::BG_ACCENT);
+                p.rect_filled(
+                    egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, 12.0)),
+                    6.0,
+                    colors::BLURPLE,
+                );
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+            }
+            let busy = matches!(
+                settings.update_phase,
+                Some(crate::updater::UpdatePhase::Downloading { .. })
+                    | Some(crate::updater::UpdatePhase::Installing)
+            );
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(210.0, 32.0), Sense::click());
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let p = ui.painter_at(r);
+            p.rect_filled(r, 6.0, if busy { colors::BG_ACCENT } else { colors::GREEN });
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                if busy { "Downloading..." } else { "Download and restart" },
+                egui::FontId::proportional(13.0),
+                colors::TEXT_PRIMARY,
+            );
+            if resp.clicked() && !busy {
+                let info = info.clone();
+                let ctx = ui.ctx().clone();
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new("update_phase"),
+                        crate::updater::UpdatePhase::Verifying,
+                    )
+                });
+                tokio::spawn(async move {
+                    let ctx2 = ctx.clone();
+                    let phase_fn = move |phase: crate::updater::UpdatePhase| {
+                        ctx2.data_mut(|d| {
+                            d.insert_temp(egui::Id::new("update_phase"), phase.clone())
+                        });
+                        ctx2.request_repaint();
+                    };
+                    match crate::updater::download_and_verify(&info, phase_fn).await {
+                        Ok(bytes) => {
+                            ctx.data_mut(|d| {
+                                d.insert_temp(
+                                    egui::Id::new("update_phase"),
+                                    crate::updater::UpdatePhase::Installing,
+                                )
+                            });
+                            ctx.request_repaint();
+                            if let Err(e) = crate::updater::install(&bytes, &info) {
+                                ctx.data_mut(|d| {
+                                    d.insert_temp(
+                                        egui::Id::new("update_phase"),
+                                        crate::updater::UpdatePhase::Failed(format!("{e}")),
+                                    )
+                                });
+                            }
+                            // install() exits on success.
+                        }
+                        Err(e) => {
+                            ctx.data_mut(|d| {
+                                d.insert_temp(
+                                    egui::Id::new("update_phase"),
+                                    crate::updater::UpdatePhase::Failed(format!("{e}")),
+                                )
+                            });
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    ui.add_space(14.0);
+    sub_title(ui, "System");
+    ui.label(
+        egui::RichText::new(format!(
+            "basalt {} - {} - {} profile",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+        ))
+        .size(12.0)
+        .color(colors::TEXT_MUTED),
+    );
 }
 
 fn about_section(ui: &mut Ui) {

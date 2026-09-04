@@ -20,6 +20,8 @@ pub enum Route {
     ChannelReactions(Snowflake),
     ChannelPins(Snowflake),
     ChannelThreads(Snowflake),
+    ChannelInvites(Snowflake),
+    Message(Snowflake),
     User(Snowflake),
 }
 
@@ -37,6 +39,8 @@ impl Route {
             Self::ChannelReactions(id) => format!("/channels/{id}/messages/%/reactions"),
             Self::ChannelPins(id) => format!("/channels/{id}/pins"),
             Self::ChannelThreads(id) => format!("/channels/{id}/threads"),
+            Self::ChannelInvites(id) => format!("/channels/{id}/invites"),
+            Self::Message(id) => format!("/channels/{id}/messages"),
             Self::User(id) => format!("/users/{id}"),
         }
     }
@@ -68,6 +72,9 @@ pub struct CreateMessageBody {
     /// Allowed mentions: parse `["users","roles","everyone"]` to restrict.
     #[serde(skip_serializing_if = "Option::is_none", rename = "allowed_mentions")]
     pub allowed_mentions: Option<AllowedMentions>,
+    /// Stickers to send (guild stickers the bot can use).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub sticker_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]

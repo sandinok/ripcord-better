@@ -1,11 +1,12 @@
 //! Configuration for Basalt.
 //!
-//! A small TOML-backed config that stores the Discord token (encrypted
-//! envelope on disk), appearance preferences, and a few flags. The
-//! [`Config`] struct is the single source of truth for everything that
-//! survives across launches.
+//! A small TOML-backed config that stores appearance preferences and a
+//! few flags. The Discord token lives in the OS secret store (see
+//! [`secrets`]): DPAPI on Windows, Keychain on macOS, a 0600 file on
+//! Linux. `config.toml` only keeps an envelope marker.
 
 pub mod cli;
+pub mod secrets;
 
 use std::path::{Path, PathBuf};
 
@@ -14,13 +15,19 @@ use serde::{Deserialize, Serialize};
 
 /// Basalt's persistent configuration.
 ///
-/// Stored as TOML at the path returned by [`default_path`]. The Discord
-/// token is kept in the file (with restrictive permissions on Unix) for
-/// the beta; a future release will move it to an OS keyring envelope.
+/// Stored as TOML at the path returned by [`default_path`]. The `token`
+/// field, when present, is an envelope ("dpapi:...", "keychain:1",
+/// "file:1") or - only for pre-0.2 configs - a legacy plaintext value
+/// that gets migrated to the OS store on first load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Discord bot or user token. `None` means "not signed in".
+    /// Sealed-token envelope, `None` means "not signed in".
     pub token: Option<String>,
+
+    /// Session-only token override (`--token` / `DISCORD_TOKEN`).
+    /// Never serialized, never persisted.
+    #[serde(skip)]
+    pub session_override: Option<String>,
 
     /// `false` = modern (2026) status dot palette, `true` = legacy.
     #[serde(default)]
@@ -52,6 +59,62 @@ pub struct Config {
     /// accounts get the full list from READY anyway; the cache is harmless.
     #[serde(default)]
     pub dm_channel_ids: Vec<String>,
+
+    /// DMs pinned to the top of the home list (context menu "Pin DM").
+    #[serde(default)]
+    pub pinned_dms: Vec<String>,
+
+    /// Server folders: each folder groups guild ids.
+    #[serde(default)]
+    pub guild_folders: Vec<GuildFolder>,
+
+    /// Sidebar width in px (resizable, persisted).
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+
+    /// Members panel width in px (resizable, persisted).
+    #[serde(default = "default_members_width")]
+    pub members_width: f32,
+
+    /// Enter sends the message (Discord default). Off = Enter is a
+    /// newline, Ctrl+Enter sends.
+    #[serde(default = "default_true")]
+    pub enter_to_send: bool,
+
+    /// Check for updates on startup + manual check button.
+    #[serde(default = "default_true")]
+    pub auto_updates: bool,
+
+    /// Notification sounds (mention ping).
+    #[serde(default = "default_true")]
+    pub notification_sounds: bool,
+
+    /// Desktop-style toasts for mentions while the window is unfocused.
+    #[serde(default = "default_true")]
+    pub desktop_notifications: bool,
+
+    /// One-shot startup notice (updater result), never persisted.
+    #[serde(skip)]
+    pub startup_notice: Option<String>,
+}
+
+/// A server folder in the guild bar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuildFolder {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    pub guild_ids: Vec<String>,
+}
+
+fn default_sidebar_width() -> f32 {
+    240.0
+}
+fn default_members_width() -> f32 {
+    240.0
+}
+fn default_true() -> bool {
+    true
 }
 
 fn default_density() -> String {
@@ -78,6 +141,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             token: None,
+            session_override: None,
             use_legacy_status_dots: false,
             density: default_density(),
             show_members: default_show_members(),
@@ -85,6 +149,15 @@ impl Default for Config {
             show_unread_badges: default_badges(),
             title_mentions: default_title_mentions(),
             dm_channel_ids: Vec::new(),
+            pinned_dms: Vec::new(),
+            guild_folders: Vec::new(),
+            sidebar_width: default_sidebar_width(),
+            members_width: default_members_width(),
+            enter_to_send: default_true(),
+            auto_updates: default_true(),
+            notification_sounds: default_true(),
+            desktop_notifications: default_true(),
+            startup_notice: None,
         }
     }
 }
@@ -116,17 +189,82 @@ impl Config {
             if let Ok(env_token) = std::env::var("DISCORD_TOKEN") {
                 let trimmed = env_token.trim().to_string();
                 if !trimmed.is_empty() {
-                    cfg.token = Some(trimmed);
+                    cfg.session_override = Some(trimmed);
                 }
             }
         }
 
         // CLI override wins.
         if let Some(t) = &args.token {
-            cfg.token = Some(t.clone());
+            cfg.session_override = Some(t.clone());
+        }
+
+        // Migrate a legacy plaintext token (pre-0.2 config) into the OS
+        // secret store right now, so nothing plaintext survives on disk.
+        if let Some(stored) = cfg.token.clone() {
+            if !stored.starts_with("dpapi:")
+                && !stored.starts_with("keychain:")
+                && !stored.starts_with("file:")
+            {
+                match secrets::seal(stored.trim()) {
+                    Ok(envelope) => {
+                        cfg.token = Some(envelope);
+                        tracing::info!("legacy plaintext token migrated to the OS secret store");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not migrate token to the OS store");
+                    }
+                }
+            }
         }
 
         Ok(cfg)
+    }
+
+    /// The usable (unsealed) token, or `None` when signed out. The
+    /// session override (`--token` / env) wins over the stored envelope.
+    pub fn plain_token(&self) -> Option<String> {
+        if let Some(t) = self.session_override.as_deref() {
+            let t = t.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        let stored = self.token.as_deref()?;
+        match secrets::unseal(stored) {
+            Ok(plain) => {
+                let plain = plain.trim().to_string();
+                if plain.is_empty() {
+                    None
+                } else {
+                    Some(plain)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "stored token could not be unsealed");
+                None
+            }
+        }
+    }
+
+    /// Seal and remember a token (sign-in).
+    pub fn set_plain_token(&mut self, plain: &str) {
+        match secrets::seal(plain.trim()) {
+            Ok(envelope) => self.token = Some(envelope),
+            Err(e) => {
+                // Never fall back to plaintext-on-disk: keep it in memory
+                // for this session and say why.
+                tracing::warn!(error = %e, "OS secret store unavailable; token kept in memory only");
+                self.session_override = Some(plain.trim().to_string());
+            }
+        }
+    }
+
+    /// Forget the stored token entirely (sign out).
+    pub fn clear_token(&mut self) {
+        self.token = None;
+        self.session_override = None;
+        secrets::wipe();
     }
 
     /// Persist the config to disk. Creates the parent directory if needed.
@@ -184,15 +322,41 @@ mod tests {
     }
 
     #[test]
+    fn legacy_plain_token_migrates_to_envelope() {
+        // A pre-0.2 config with a plaintext token must come back sealed.
+        let toml_str = "token = \"definitely-a-legacy-plaintext-value\"\nshow_members = true\n";
+        let mut c: Config = toml::from_str(toml_str).unwrap_or_default();
+        // Simulate load()'s migration branch.
+        if let Some(stored) = c.token.clone() {
+            if !stored.starts_with("dpapi:")
+                && !stored.starts_with("keychain:")
+                && !stored.starts_with("file:")
+            {
+                if let Ok(env) = secrets::seal(stored.trim()) {
+                    c.token = Some(env);
+                }
+            }
+        }
+        let sealed = c.token.unwrap();
+        assert!(
+            sealed.starts_with("dpapi:")
+                || sealed.starts_with("keychain:")
+                || sealed.starts_with("file:"),
+            "sealed envelope expected, got: {sealed}"
+        );
+    }
+
+    #[test]
     fn config_round_trips_through_toml() {
         let mut c = Config::default();
-        c.token = Some("ghp_test_token_value_123".to_string());
+        c.token = Some("dpapi:ZmFrZQ==".to_string());
         c.density = "compact".to_string();
         c.use_legacy_status_dots = true;
         c.show_members = false;
         let s = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
-        assert_eq!(back.token.as_deref(), Some("ghp_test_token_value_123"));
+        assert_eq!(back.token.as_deref(), Some("dpapi:ZmFrZQ=="));
+        assert_eq!(back.session_override, None, "session override never persists");
         assert_eq!(back.density, "compact");
         assert!(back.use_legacy_status_dots);
         assert!(!back.show_members);

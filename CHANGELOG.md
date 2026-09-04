@@ -3,6 +3,58 @@
 All notable changes to Basalt are documented here. The format follows
 Keep a Changelog 1.1.0.
 
+## 0.2.0 - 2026-09-04
+
+The big one. Token security, the full Discord look, and a self-updater.
+
+### Security
+
+- Token at rest now lives in the OS key store: DPAPI on Windows, Keychain
+  on macOS, a 0600 file on Linux. Plain-text configs migrate on first
+  run. Never written to disk in the clear again.
+- Every log line and panic goes through a redaction layer. The token
+  (and anything shaped like one) can never reach stderr or a crash dump.
+- Local send cap (30 messages per rolling minute) plus the existing
+  exactly-one-POST rule. Discord 429s are waited out in full, never
+  retried.
+- If Discord answers with a block, captcha or verification wall, all
+  sending stops with a loud banner and stays stopped until you press
+  Retry. The app never unlocks itself.
+- Reconnects now have a hard cap of 20 consecutive failures before
+  parking, and reconnecting is self-driven (a dropped session heals even
+  with the member list hidden or a DM open).
+
+### Added
+
+- YouTube links render as real video cards: source, clickable title,
+  big thumbnail with a play button (oEmbed, no API key).
+- GIFs keep their GIF tag, jumbo single-emoji messages, guild stickers,
+  emoji picker with server emoji and search, file uploads from the
+  composer.
+- Full profile popups: banner, badges, bio with View Full Bio, pronouns,
+  member since, activity, role pills. Member rows get owner crowns, APP
+  tags and activity lines.
+- Server folders (right-click to create, click to expand), Events and
+  Boosts rows with live data, voice channels with connected users,
+  channel hover actions (invite link, rename, delete, new channel).
+- Home revamp: Friends, Nitro, Shop, Quests, Message Requests, pinned
+  DMs, DM filters, unread and mention badges everywhere, pins dot.
+- Settings rework: searchable nav with Edit Profile, Appearance with
+  live preview, Notifications, Behavior (Enter to send), Advanced
+  (cache, updates) with a real GitHub self-updater (checksum, swap,
+  restart, rollback).
+- Login rework: animated background, pulsing logo, show/hide and paste
+  for the token, validating state, error shake, splash transition.
+- Reply bars with mini avatar and snippet, DM headers with call icons,
+  resizable sidebars with remembered widths, mention toasts and
+  desktop notifications.
+
+### Fixed
+
+- The gateway reconnect loop parked between connections until some UI
+  widget happened to send a command, which is why the connection banner
+  could stick around in DMs. It is now self-driving.
+
 ## 0.1.2 - 2026-09-04
 
 The stability and visuals release. The session never drops, and the chat

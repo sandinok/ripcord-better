@@ -65,6 +65,9 @@ pub enum Outbound {
     /// Ask Discord for the full member list of a guild (op 8). Delivered
     /// back as GUILD_MEMBERS_CHUNK dispatches, which feed the member list.
     RequestMembers { guild_id: crate::model::Snowflake },
+    /// User-authorized manual reconnect (the Retry button on the
+    /// "connection lost" banner after the automatic-attempt cap).
+    Reconnect,
     /// Soft-shutdown the gateway task.
     Shutdown,
 }
@@ -122,39 +125,98 @@ impl Gateway {
             // Reconnect backoff state: exponential with jitter, reset after
             // a connection survives long enough. See sleep_backoff.
             let mut backoff: u64 = BASE_BACKOFF_MS;
+            // Consecutive failed connections. A stable connection resets
+            // it to 0. When it reaches MAX_RECONNECT_ATTEMPTS the loop
+            // stops reconnecting (zero reconnect storms) and waits for a
+            // user-authorized Outbound::Reconnect.
+            let mut failed_attempts: u32 = 0;
+            let mut halted = false;
             // Start with the full intent set (members, presences, message
             // content); if Discord closes with 4014 we retry once with the
             // baseline set so the app still works, just without presence.
             let mut intent_set = intents::FULL;
 
             while !shutdown {
-                // Wait for a connect or shutdown signal before doing anything.
-                tokio::select! {
-                    biased;
-                    Some(cmd) = outbound_rx.recv() => {
-                        match cmd {
-                            Outbound::Connect { token: t, bot } => {
-                                if t.is_empty() {
-                                    tracing::warn!("ignoring empty-token connect");
-                                    continue;
+                if halted {
+                    // Hard stop: park until the user hits Retry, signs in
+                    // again, or shuts down. No reconnect storm, ever.
+                    loop {
+                        tokio::select! {
+                            biased;
+                            Some(cmd) = outbound_rx.recv() => {
+                                match cmd {
+                                    Outbound::Connect { token: t, bot } => {
+                                        if !t.is_empty() {
+                                            token = Some(t);
+                                            is_bot = bot;
+                                        }
+                                        halted = false;
+                                        failed_attempts = 0;
+                                        backoff = BASE_BACKOFF_MS;
+                                        intent_set = intents::FULL;
+                                        state.set_intents_limited(false);
+                                        break;
+                                    }
+                                    Outbound::Reconnect => {
+                                        halted = false;
+                                        failed_attempts = 0;
+                                        backoff = BASE_BACKOFF_MS;
+                                        break;
+                                    }
+                                    Outbound::Shutdown => { shutdown = true; break; }
+                                    _ => {}
                                 }
-                                token = Some(t);
-                                is_bot = bot;
-                                // A fresh connect resets the intent attempt.
-                                intent_set = intents::FULL;
-                                state.set_intents_limited(false);
                             }
-                            Outbound::SetPresence { .. } => {
-                                // Not connected yet: the status will be sent
-                                // with the IDENTIFY payload on the next connect.
-                            }
-                            Outbound::RequestMembers { .. } => {
-                                // Not connected yet: the member panel retries
-                                // via its REST fallback; re-request later.
-                            }
-                            Outbound::Shutdown => { break; }
+                        }
+                        if shutdown {
+                            break;
                         }
                     }
+                    if shutdown {
+                        break;
+                    }
+                }
+                // Wait for the FIRST connect command only. After that the
+                // loop is self-driving: a dropped connection reconnects on
+                // its own (with backoff), instead of parking until some UI
+                // widget happens to send a command. (The old "block on
+                // recv() between connections" shape was the root cause of
+                // the sticky "Connection lost" banner when the member
+                // panel was hidden or a DM was open.)
+                while token.is_none() && !shutdown {
+                    tokio::select! {
+                        biased;
+                        Some(cmd) = outbound_rx.recv() => {
+                            match cmd {
+                                Outbound::Connect { token: t, bot } => {
+                                    if t.is_empty() {
+                                        tracing::warn!("ignoring empty-token connect");
+                                        continue;
+                                    }
+                                    token = Some(t);
+                                    is_bot = bot;
+                                    // A fresh connect resets the intent attempt.
+                                    intent_set = intents::FULL;
+                                    state.set_intents_limited(false);
+                                }
+                                Outbound::SetPresence { .. } => {
+                                    // Not connected yet: the status will be sent
+                                    // with the IDENTIFY payload on the next connect.
+                                }
+                                Outbound::RequestMembers { .. } => {
+                                    // Not connected yet: the member panel retries
+                                    // via its REST fallback; re-request later.
+                                }
+                                Outbound::Reconnect => {
+                                    // No session yet; nothing to reconnect.
+                                }
+                                Outbound::Shutdown => { shutdown = true; break; }
+                            }
+                        }
+                    }
+                }
+                if shutdown {
+                    break;
                 }
                 let Some(token) = token.clone() else { continue; };
 
@@ -174,23 +236,23 @@ impl Gateway {
                         tracing::info!("gateway reconnecting fresh (IDENTIFY)");
                         state.clear_session().await;
                         if started.elapsed() < STABLE_CONN_SECS {
+                            failed_attempts += 1;
                             backoff = backoff.saturating_mul(2).min(MAX_BACKOFF_MS);
                         } else {
+                            failed_attempts = 0;
                             backoff = BASE_BACKOFF_MS;
                         }
-                        sleep_backoff(backoff).await;
                     }
                     Ok(ConnOutcome::ReconnectResume) => {
                         tracing::info!("gateway reconnecting (RESUME)");
                         // RESUME right after a drop is expected behavior; only
                         // repeated fast churn backs off.
                         if started.elapsed() < STABLE_CONN_SECS {
+                            failed_attempts += 1;
                             backoff = backoff.max(BASE_BACKOFF_MS).saturating_mul(2).min(MAX_BACKOFF_MS);
                         } else {
+                            failed_attempts = 0;
                             backoff = BASE_BACKOFF_MS;
-                        }
-                        if backoff > BASE_BACKOFF_MS {
-                            sleep_backoff(backoff).await;
                         }
                     }
                     Err(GatewayError::AuthFailed) => {
@@ -217,13 +279,30 @@ impl Gateway {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "connection loop ended; backing off");
+                        failed_attempts += 1;
                         backoff = if started.elapsed() < STABLE_CONN_SECS {
                             backoff.max(BASE_BACKOFF_MS).saturating_mul(2).min(MAX_BACKOFF_MS)
                         } else {
                             BASE_BACKOFF_MS
                         };
-                        sleep_backoff(backoff).await;
                     }
+                }
+                // The reconnect-attempt cap: after MAX_RECONNECT_ATTEMPTS
+                // consecutive unstable connections we park and wait for a
+                // user-initiated retry (point 5: zero reconnect storms).
+                if failed_attempts >= MAX_RECONNECT_ATTEMPTS {
+                    tracing::error!(
+                        attempts = failed_attempts,
+                        "reconnect cap reached - halting until user retries"
+                    );
+                    state
+                        .set_connection_status(crate::state::ConnectionStatus::Disconnected)
+                        .await;
+                    halted = true;
+                    continue;
+                }
+                if !halted {
+                    sleep_backoff(backoff).await;
                 }
             }
             tracing::info!("gateway task exiting");
@@ -236,6 +315,11 @@ impl Gateway {
 /// STABLE_CONN_SECS.
 const BASE_BACKOFF_MS: u64 = 1_000;
 const MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Consecutive unstable connections before we park and wait for a
+/// user-authorized retry. Discord's own client gives up similarly; this
+/// prevents reconnect storms from bad networks or expired sessions.
+const MAX_RECONNECT_ATTEMPTS: u32 = 20;
 const STABLE_CONN_SECS: Duration = Duration::from_secs(30);
 
 /// Sleep `ms` with full jitter (uniform random in [0.6*ms, 1.3*ms]): clients
@@ -497,6 +581,9 @@ async fn run_connection_loop(
                 match cmd {
                     Outbound::Connect { .. } => {
                         // Already connected: a redundant Connect is a no-op.
+                    }
+                    Outbound::Reconnect => {
+                        // Already connected: nothing to reconnect.
                     }
                     Outbound::RequestMembers { guild_id } => {
                         // op 8: the member list + presences arrive as

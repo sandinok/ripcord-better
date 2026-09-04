@@ -57,9 +57,10 @@ impl BasaltApp {
         let shared = Arc::new(AppState::with_event_channel(event_tx));
         let _ = state::install_global(shared.clone());
 
-        let rest = Arc::new(Http::new(config.token.clone()).expect("rest client init"));
-        if let Some(t) = config.token.as_deref() {
-            rest.set_token(t.to_string());
+        let rest = Arc::new(Http::new(config.plain_token()).expect("rest client init"));
+        if let Some(t) = config.plain_token() {
+            crate::scrub::set_live_token(&t);
+            rest.set_token(t);
         }
         let _ = crate::rest::install_global(rest.clone());
 
@@ -69,7 +70,7 @@ impl BasaltApp {
 
         crate::ui::apply_dark_theme(&cc.egui_ctx, config.use_legacy_status_dots);
 
-        if let Some(token) = config.token.clone() {
+        if let Some(token) = config.plain_token() {
             tracing::info!("token present - auto-connecting gateway + fetching user");
             let rest_clone = rest.clone();
             let shared_clone = shared.clone();
@@ -144,6 +145,19 @@ impl BasaltApp {
             });
         }
 
+        // Session mirrors of config lists + the startup notice (updater).
+        {
+            let shared = shared.clone();
+            let dm_pins = config.pinned_dms.clone();
+            runtime_handle.spawn_blocking(move || {
+                shared.init_pinned_dms(&dm_pins);
+            });
+        }
+        let startup_notice = config.startup_notice.clone();
+        if let Some(notice) = startup_notice {
+            crate::ui::toast::success(notice);
+        }
+
         let (send_tx, send_rx) = crate::sender::channel();
         let rest_worker = rest.clone();
         runtime_handle.spawn(async move {
@@ -173,7 +187,9 @@ impl BasaltApp {
     /// Sign in from the login screen: probe the token type, connect the
     /// gateway, fetch user, guilds, DMs.
     fn start_session(&mut self, token: String) {
-        self.config.token = Some(token.clone());
+        crate::scrub::set_live_token(&token);
+        self.config.set_plain_token(&token);
+        let _ = self.config.save();
         self.rest.set_token(token.clone());
         let rest = self.rest.clone();
         let shared = self.shared.clone();
@@ -208,7 +224,7 @@ impl BasaltApp {
 
     /// Sign out: clear the token from config + state, disconnect gateway.
     fn sign_out(&mut self) {
-        self.config.token = None;
+        self.config.clear_token();
         let _ = self.config.save();
         self.rest.clear_token();
         let _ = self.gateway_tx.send(Outbound::Shutdown);
@@ -277,6 +293,9 @@ impl eframe::App for BasaltApp {
         // Repaint budget: snappy enough for typing indicators, cheap at idle.
         ctx.request_repaint_after(std::time::Duration::from_millis(120));
 
+        // Notification prefs (sound / banners) mirror into the notify module.
+        crate::notify::set_prefs(self.config.notification_sounds, self.config.desktop_notifications);
+
         self.pump_events(&ctx);
 
         // One-shot auto-selection of the first guild + channel. Retries
@@ -304,22 +323,38 @@ impl eframe::App for BasaltApp {
             }
         }
 
+        let sel_now = self.shared.selection_sync();
+        let group_dm = sel_now
+            .channel_id
+            .and_then(|cid| self.shared.channel_by_id(cid))
+            .map(|c| matches!(c.kind, crate::model::ChannelType::GroupDm))
+            .unwrap_or(false);
         let show_members = self.config.show_members
-            && self.shared.selection_sync().guild_id.is_some()
+            && (sel_now.guild_id.is_some() || group_dm)
             && self.shared.current_user().is_some();
 
-        // ── Right: member list (resizable) ──
+        // ── Right: member list (resizable, width persisted) ──
         if show_members {
             let shared = self.shared.clone();
+            let group_dm_v = group_dm;
             egui::Panel::right("members")
                 .resizable(true)
-                .default_size(240.0)
+                .default_size(self.config.members_width)
                 .min_size(180.0)
                 .max_size(360.0)
                 .frame(egui::Frame::new().fill(colors::BG_SIDEBAR).inner_margin(egui::Margin::same(0)))
                 .show_separator_line(false)
                 .show(ui, |ui| {
-                    crate::ui::members::render(ui, &shared);
+                    if group_dm_v {
+                        crate::ui::members::render_group_dm(ui, &shared);
+                    } else {
+                        crate::ui::members::render(ui, &shared);
+                    }
+                    let w = ui.min_rect().width();
+                    let saved = self.config.members_width;
+                    if (w - saved).abs() > 1.0 && (180.0..=360.0).contains(&w) {
+                        self.config.members_width = w;
+                    }
                 });
         }
 
@@ -327,12 +362,13 @@ impl eframe::App for BasaltApp {
         {
             let shared = self.shared.clone();
             let rest = self.rest.clone();
+            let config = &mut self.config;
             let new_sel = egui::Panel::left("guilds")
                 .exact_size(72.0)
                 .frame(egui::Frame::new().fill(colors::BG_GUILDS_BAR).inner_margin(egui::Margin::same(0)))
                 .show_separator_line(false)
                 .show(ui, |ui| {
-                    crate::ui::guilds_bar::render(ui, &shared, rest)
+                    crate::ui::guilds_bar::render(ui, &shared, rest, config)
                 })
                 .inner;
             if let Some(sel) = new_sel {
@@ -344,19 +380,39 @@ impl eframe::App for BasaltApp {
             }
         }
 
-        // ── Left: sidebar (240px, full height) ──
+        // ── Left: sidebar (resizable, full height, width persisted) ──
+        let sidebar_w = self.config.sidebar_width;
         {
             let shared = self.shared.clone();
             let rest = self.rest.clone();
-            let config = self.config.clone();
+            let config = &mut self.config;
             let new_sel = egui::Panel::left("sidebar")
-                .exact_size(240.0)
+                .resizable(true)
+                .default_size(sidebar_w)
+                .min_size(200.0)
+                .max_size(360.0)
                 .frame(egui::Frame::new().fill(colors::BG_SIDEBAR).inner_margin(egui::Margin::same(0)))
                 .show_separator_line(false)
                 .show(ui, |ui| {
-                    crate::ui::sidebar::render(ui, &shared, rest, &config)
+                    let out = crate::ui::sidebar::render(ui, &shared, rest, config);
+                    // Persist the dragged width (throttled: only when it
+                    // actually changed by a pixel or more).
+                    let w = ui.min_rect().width();
+                    let saved = config.sidebar_width;
+                    if (w - saved).abs() > 1.0 && (200.0..=360.0).contains(&w) {
+                        config.sidebar_width = w;
+                    }
+                    out
                 })
                 .inner;
+            let saved_key = egui::Id::new("sidebar_saved_w");
+            let saved: f32 = ctx
+                .data(|d| d.get_temp::<f32>(saved_key))
+                .unwrap_or(self.config.sidebar_width);
+            if (self.config.sidebar_width - saved).abs() > 1.0 {
+                let _ = self.config.save();
+                ctx.data_mut(|d| d.insert_temp(saved_key, self.config.sidebar_width));
+            }
             if let Some(sel) = new_sel {
                 // Selecting a channel: fetch its history if needed.
                 let new_sel = sel;
@@ -395,7 +451,7 @@ impl eframe::App for BasaltApp {
                     } else {
                         let just_signed_in = crate::ui::login::render(ui, login, config);
                         if just_signed_in {
-                            if let Some(token) = config.token.clone() {
+                            if let Some(token) = config.plain_token() {
                                 *start_token_ref = Some(token);
                             }
                         }
@@ -443,6 +499,9 @@ impl eframe::App for BasaltApp {
             self.sign_out();
         }
 
+        // Toasts (copies, update progress, notices) render above all.
+        crate::ui::toast::render(&ctx);
+
         // ── Connection banner (bottom of chat, Discord-style) ──
         let status = self.shared.connection_status_sync();
         if matches!(
@@ -458,9 +517,10 @@ impl eframe::App for BasaltApp {
                 state::ConnectionStatus::AuthFailed => colors::RED,
                 _ => colors::STATUS_IDLE,
             };
+            let side_w = self.config.sidebar_width;
             let banner_rect = egui::Rect::from_min_size(
-                ctx.viewport_rect().min + egui::vec2(72.0 + 240.0, ctx.viewport_rect().height() - 28.0),
-                egui::vec2(ctx.viewport_rect().width() - 72.0 - 240.0, 28.0),
+                ctx.viewport_rect().min + egui::vec2(72.0 + side_w, ctx.viewport_rect().height() - 28.0),
+                egui::vec2(ctx.viewport_rect().width() - 72.0 - side_w, 28.0),
             );
             let painter = ctx.layer_painter(egui::LayerId::background());
             painter.rect_filled(banner_rect, 0.0, colors::BG_FLOATING);

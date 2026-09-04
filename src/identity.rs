@@ -38,7 +38,7 @@ pub fn web_user_agent() -> String {
 
 /// Placeholder UA installed as the reqwest *default* header (Cloudflare
 /// wants one on every request); real requests override it per call.
-pub const PLACEHOLDER_UA: &str = "Basalt (https://github.com/sandinok/basalt, 0.1.2)";
+pub const PLACEHOLDER_UA: &str = "Basalt (https://github.com/sandinok/basalt, 0.2.0)";
 
 /// UA for CDN image fetches (avatars, emojis, embeds). Cloudflare rejects
 /// UA-less requests to cdn.discordapp.com with 403 - this must never be
@@ -50,7 +50,7 @@ pub fn image_user_agent() -> String {
 /// User-Agent for bot sessions. Discord's documented convention for API
 /// clients; honest and expected for a bot token.
 pub fn bot_user_agent() -> String {
-    "Basalt (https://github.com/sandinok/basalt, 0.1.2)".to_string()
+    "Basalt (https://github.com/sandinok/basalt, 0.2.0)".to_string()
 }
 
 /// The `properties` object for a user-session gateway IDENTIFY: the same

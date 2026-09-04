@@ -229,6 +229,48 @@ pub fn label_width(ui: &Ui, text: &str, font_size: f32) -> f32 {
     w
 }
 
+/// Curated emoji set for the composer picker: (short name, cluster).
+pub const PICKER_SET: &[(&str, &str)] = &[
+    ("grinning", "😀"), ("smile", "😄"), ("joy", "😂"), ("rofl", "🤣"), ("wink", "😉"),
+    ("blush", "😊"), ("heart eyes", "😍"), ("kissing", "😘"), ("tongue", "😜"),
+    ("thinking", "🤔"), ("shush", "🤫"), ("facepalm", "🤦"), ("shrug", "🤷"),
+    ("salute", "🫡"), ("nerd", "🤓"), ("sunglasses", "😎"), ("party", "🥳"),
+    ("sleep", "😴"), ("cry", "😢"), ("sob", "😭"), ("angry", "😠"), ("rage", "😡"),
+    ("scream", "😱"), ("flushed", "😳"), ("pleading", "🥺"), ("smirk", "😏"),
+    ("upside down", "🙃"), ("star struck", "🤩"), ("zany", "🤪"), ("monocle", "🧐"),
+    ("fire", "🔥"), ("sparkles", "✨"), ("star", "⭐"), ("boom", "💥"), ("zap", "⚡"),
+    ("rainbow", "🌈"), ("comet", "☄️"), ("sun", "☀️"), ("moon", "🌙"), ("cloud", "☁️"),
+    ("snowflake", "❄️"), ("rocket", "🚀"), ("airplane", "✈️"), ("car", "🚗"),
+    ("ship", "🚢"), ("anchor", "⚓"), ("house", "🏠"), ("office", "🏢"), ("castle", "🏰"),
+    ("heart", "❤️"), ("orange heart", "🧡"), ("yellow heart", "💛"), ("green heart", "💚"),
+    ("blue heart", "💙"), ("purple heart", "💜"), ("black heart", "🖤"), ("broken heart", "💔"),
+    ("sparkling heart", "💖"), ("two hearts", "💕"), ("heart ribbon", "💝"),
+    ("thumbs up", "👍"), ("thumbs down", "👎"), ("ok hand", "👌"), ("peace", "✌️"),
+    ("wave", "👋"), ("clap", "👏"), ("pray", "🙏"), ("muscle", "💪"), ("point up", "👆"),
+    ("point right", "👉"), ("eyes", "👀"), ("brain", "🧠"), ("skull", "💀"), ("ghost", "👻"),
+    ("alien", "👽"), ("robot", "🤖"), ("poop", "💩"), ("clown", "🤡"),
+    ("cat", "🐱"), ("dog", "🐶"), ("fox", "🦊"), ("panda", "🐼"), ("penguin", "🐧"),
+    ("owl", "🦉"), ("unicorn", "🦄"), ("frog", "🐸"), ("turtle", "🐢"), ("snake", "🐍"),
+    ("spider", "🕷️"), ("crab", "🦀"), ("dolphin", "🐬"), ("whale", "🐳"), ("octopus", "🐙"),
+    ("pizza", "🍕"), ("burger", "🍔"), ("taco", "🌮"), ("burrito", "🌯"), ("ramen", "🍜"),
+    ("coffee", "☕"), ("tea", "🍵"), ("beer", "🍺"), ("wine", "🍷"), ("cocktail", "🍹"),
+    ("cake", "🍰"), ("cookie", "🍪"), ("popcorn", "🍿"), ("donut", "🍩"), ("ice cream", "🍦"),
+    ("gaming", "🎮"), ("joystick", "🕹️"), ("dice", "🎲"), ("puzzle", "🧩"), ("chess", "♟️"),
+    ("trophy", "🏆"), ("medal", "🏅"), ("crown", "👑"), ("gem", "💎"), ("ring", "💍"),
+    ("money", "💰"), ("chart up", "📈"), ("chart down", "📉"), ("coin", "🪙"),
+    ("lock", "🔒"), ("key", "🔑"), ("hammer", "🔨"), ("wrench", "🔧"), ("gear", "⚙️"),
+    ("magnifier", "🔎"), ("bulb", "💡"), ("book", "📖"), ("books", "📚"), ("memo", "📝"),
+    ("pencil", "✏️"), ("paint", "🎨"), ("guitar", "🎸"), ("microphone", "🎤"),
+    ("headphones", "🎧"), ("music", "🎵"), ("drum", "🥁"), ("trumpet", "🎺"),
+    ("bell", "🔔"), ("mega", "📣"), ("speech", "💬"), ("envelope", "✉️"), ("inbox", "📥"),
+    ("package", "📦"), ("gift", "🎁"), ("balloon", "🎈"), ("confetti", "🎊"),
+    ("check", "✅"), ("cross", "❌"), ("question", "❓"), ("exclamation", "❗"),
+    ("warning", "⚠️"), ("no entry", "⛔"), ("recycle", "♻️"), ("info", "ℹ️"),
+    ("hundred", "💯"), ("infinity", "♾️"), ("red circle", "🔴"), ("green circle", "🟢"),
+    ("flag colombia", "🇨🇴"), ("flag us", "🇺🇸"), ("flag argentina", "🇦🇷"),
+    ("flag mexico", "🇲🇽"), ("flag spain", "🇪🇸"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

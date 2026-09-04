@@ -25,7 +25,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: windows-x86_64
             binary: basalt.exe
-            archive: basalt-${{ inputs.tag || github.ref_name }}-windows-x86_64.zip
+            archive: basalt-${{ inputs.tag || github.ref_name }}-windows-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             name: macos-arm64
@@ -59,20 +59,26 @@ jobs:
         run: cargo test --release
 
       # ── Windows: single .exe (icon embedded at build time via build.rs +
-      # winresource, so Explorer and the taskbar show the Basalt mark) ──
-      - name: Package (zip)
+      # winresource, so Explorer and the taskbar show the Basalt mark).
+      # Shipped as tar.gz since v0.2 so the in-app updater has ONE
+      # extraction path on every platform (Windows 10+ ships bsdtar and
+      # Explorer opens tar.gz natively). ──
+      - name: Package (tar.gz)
         if: matrix.name == 'windows-x86_64'
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/"
-          Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.archive }}" -Force
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/
+          (cd dist && tar czf "${{ matrix.archive }}" "${{ matrix.binary }}")
 
       # ── macOS: real .app bundle with Info.plist + icns, so Finder and the
       # Dock show the icon and Launchpad lists the app ──
       - name: Package (.app bundle)
         if: matrix.name == 'macos-arm64'
         shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           APP="dist/Basalt.app"
@@ -88,8 +94,8 @@ jobs:
             <key>CFBundleDisplayName</key><string>Basalt</string>
             <key>CFBundleExecutable</key><string>Basalt</string>
             <key>CFBundleIdentifier</key><string>com.sandinok.basalt</string>
-            <key>CFBundleVersion</key><string>0.1.1</string>
-            <key>CFBundleShortVersionString</key><string>0.1.1</string>
+            <key>CFBundleVersion</key><string>__VERSION__</string>
+            <key>CFBundleShortVersionString</key><string>__VERSION__</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
@@ -101,6 +107,9 @@ jobs:
           # Sign ad-hoc so macOS Gatekeeper treats it as a locally-built app
           # instead of "unidentified developer" (no distribution cert yet).
           codesign --force --deep --sign - "$APP" || true
+          # Version comes from the tag (vX.Y.Z -> X.Y.Z).
+          VERSION="${TAG#v}"
+          sed -i.bak "s/__VERSION__/$VERSION/g" "$APP/Contents/Info.plist" && rm -f "$APP/Contents/Info.plist.bak"
           (cd dist && tar czf "${{ matrix.archive }}" "Basalt.app")
 
       # ── Linux: plain binary ──
@@ -121,3 +130,22 @@ jobs:
           # Create the release if it does not exist yet, then upload.
           gh release view "$TAG" 2>/dev/null || gh release create "$TAG" --title "Basalt $TAG" --notes "Release notes."
           gh release upload "$TAG" "dist/${{ matrix.archive }}" --clobber
+
+  checksums:
+    name: Checksums
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate basalt-checksums.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets_dl
+          gh release download "$TAG" --pattern "basalt-*.tar.gz" --dir assets_dl
+          (cd assets_dl && sha256sum basalt-*.tar.gz > ../basalt-checksums.txt)
+          cat basalt-checksums.txt
+          gh release upload "$TAG" "basalt-checksums.txt" --clobber

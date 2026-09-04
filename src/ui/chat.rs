@@ -79,6 +79,25 @@ pub struct ChatState {
     pub search_query: String,
     /// When the current user card was opened (click on avatar/name).
     pub card_opened: Option<std::time::Instant>,
+    /// Composer right-side popup: emoji / sticker / gift / gif pickers.
+    pub composer_popup: ComposerPopup,
+    pub composer_popup_opened: Option<std::time::Instant>,
+    /// Live filter of the emoji picker (custom + unicode).
+    pub picker_search: String,
+    /// GIF-by-URL input inside the gif popup.
+    pub gif_url_input: String,
+    /// Sticker picker search.
+    pub sticker_search: String,
+}
+
+/// Which composer popup is open (right side buttons).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerPopup {
+    None,
+    Emoji,
+    Sticker,
+    Gift,
+    GifUrl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +124,11 @@ impl Default for ChatState {
             header_popup_opened: None,
             search_query: String::new(),
             card_opened: None,
+            composer_popup: ComposerPopup::None,
+            composer_popup_opened: None,
+            picker_search: String::new(),
+            gif_url_input: String::new(),
+            sticker_search: String::new(),
         }
     }
 }
@@ -124,26 +148,32 @@ pub fn render(
     ui.set_min_height(ui.available_height());
 
     let Some(ch) = channel else {
-        // No channel: header + centered hint + disabled composer.
+        // No channel: a home page (Friends/Nitro/...) if one is active,
+        // else the centered hint. Header + composer stay.
+        let page = crate::ui::home::active_page(ui);
         egui::Panel::top("chat_header")
             .exact_size(48.0)
             .frame(egui::Frame::new().fill(colors::BG_CHAT).inner_margin(egui::Margin::same(0)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                render_header(ui, None, config, chat_state);
+                render_header(ui, app_state, None, config, chat_state);
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(colors::BG_CHAT).inner_margin(egui::Margin::same(0)))
             .show(ui, |ui| {
-                render_no_channel(ui);
+                if let Some(page) = page.as_deref() {
+                    crate::ui::home::render(ui, app_state, page);
+                } else {
+                    render_no_channel(ui);
+                }
             });
         egui::Panel::bottom("chat_composer")
             .exact_size(72.0)
             .frame(egui::Frame::new().fill(colors::BG_CHAT).inner_margin(egui::Margin::same(0)))
             .show_separator_line(false)
             .show(ui, |ui| {
-                render_composer(ui, app_state, sender, chat_state, None);
+                render_composer(ui, app_state, sender, chat_state, None, config);
             });
         return;
     };
@@ -155,7 +185,7 @@ pub fn render(
         .show_separator_line(false)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            render_header(ui, Some(&ch), config, chat_state);
+            render_header(ui, app_state, Some(&ch), config, chat_state);
         });
 
     // ── Composer (bottom panel, ALWAYS visible) ──
@@ -176,7 +206,7 @@ pub fn render(
         .show_separator_line(false)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            render_composer(ui, app_state, sender, chat_state, Some(&ch));
+            render_composer(ui, app_state, sender, chat_state, Some(&ch), config);
         });
 
     // ── Message history (fills everything between) ──
@@ -325,8 +355,13 @@ fn render_date_divider(ui: &mut Ui, day: time::OffsetDateTime) {
 
 // ───────────────────────────── header ─────────────────────────────
 
+fn app_state_pins_unread(_ui: &Ui, cid: Snowflake) -> bool {
+    crate::state::global().map(|s| s.pins_unread(cid)).unwrap_or(false)
+}
+
 fn render_header(
     ui: &mut Ui,
+    _app_state: &AppState,
     channel: Option<&Channel>,
     config: &mut crate::config::Config,
     chat_state: &mut ChatState,
@@ -388,10 +423,37 @@ fn render_header(
         colors::BG_ACCENT.gamma_multiply(0.5),
     );
 
+    // Ctrl+M toggles the member list from anywhere in the chat column.
+    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::M)) {
+        config.show_members = !config.show_members;
+        let _ = config.save();
+    }
+
     // Right-side actions, official order: pins, inbox (bell), search,
     // members toggle. Each opens its popup below the header.
-    let show_members_action = channel.map(|c| c.guild_id.is_some()).unwrap_or(false);
+    let show_members_action = channel
+        .map(|c| c.guild_id.is_some() || matches!(c.kind, crate::model::ChannelType::GroupDm))
+        .unwrap_or(false);
+    let is_dm = channel
+        .map(|c| matches!(c.kind, crate::model::ChannelType::Dm | crate::model::ChannelType::GroupDm))
+        .unwrap_or(false);
     let mut x = rect.max.x - 28.0;
+    // DM/group header: call + video (honest: no WebRTC voice stack yet).
+    if is_dm {
+        for (icon, tooltip) in [("call", "Start voice call"), ("videocam", "Start video call")] {
+            let r = Rect::from_center_size(egui::pos2(x, rect.center().y), Vec2::splat(32.0));
+            let resp = ui
+                .interact(r, ui.id().with(("dm_call", icon)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("{tooltip} (not supported yet)"));
+            let c = if resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_TERTIARY };
+            crate::icons::draw(ui.painter(), icon, r.center(), 20.0, c);
+            if resp.clicked() {
+                crate::ui::toast::info("Voice and video calls need the WebRTC stack, which Basalt does not ship yet. Nothing was dialed.");
+            }
+            x -= 36.0;
+        }
+    }
     let mut popup_just_opened: Option<HeaderPopup> = None;
     if show_members_action {
         let m_rect = Rect::from_center_size(egui::pos2(x, rect.center().y), Vec2::splat(32.0));
@@ -458,6 +520,13 @@ fn render_header(
         let active = chat_state.header_popup == HeaderPopup::Pins;
         let c = if active || resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_TERTIARY };
         crate::icons::draw(ui.painter(), "keep", r.center(), 20.0, c);
+        // Red dot when new pins landed since the popup was last opened.
+        if let Some(c) = channel {
+            if app_state_pins_unread(ui, c.id) {
+                let dot = Rect::from_center_size(egui::pos2(r.right() - 8.0, r.top() + 10.0), Vec2::splat(8.0));
+                ui.painter().circle_filled(dot.center(), 4.5, colors::RED);
+            }
+        }
         if resp.clicked() {
             chat_state.header_popup = if active { HeaderPopup::None } else { HeaderPopup::Pins };
             if chat_state.header_popup == HeaderPopup::Pins {
@@ -465,6 +534,9 @@ fn render_header(
                 // Kick a pins fetch (deduped in the popup itself).
                 if let (Some(rest), Some(c)) = (crate::rest::global(), channel) {
                     fetch_pins(rest, c.id);
+                    if let Some(s) = crate::state::global() {
+                        s.clear_pins_unread(c.id);
+                    }
                 }
             }
         }
@@ -660,46 +732,43 @@ fn render_message_row(
                     });
                     ui.add_space(2.0);
                 }
-                // Reply reference.
-                if msg.referenced_message.as_ref().is_some() || msg.message_reference.is_some() {
-                    ui.horizontal(|ui| {
-                        let (line_rect, _) = ui.allocate_exact_size(egui::vec2(2.0, 14.0), Sense::hover());
-                        ui.painter_at(line_rect).rect_filled(
-                            Rect::from_min_size(
-                                line_rect.min,
-                                egui::vec2(2.0, 14.0),
-                            ),
-                            1.0,
-                            colors::TEXT_MUTED,
-                        );
-                        ui.add_space(6.0);
-                        if let Some(ref_msg) = msg.referenced_message.as_ref() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Replying to {}",
-                                    ref_msg.author.display_name()
-                                ))
-                                .color(colors::TEXT_LINK)
-                                .size(12.5),
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new("Replying to a message")
-                                    .color(colors::TEXT_LINK)
-                                    .size(12.5),
-                            );
-                        }
-                    });
-                    ui.add_space(2.0);
+                // Reply reference: mini avatar + name + snippet + thread
+                // line to the quoted message (Discord's reply header).
+                if msg.referenced_message.is_some() || msg.message_reference.is_some() {
+                    render_reply_reference(ui, app_state, msg, rest.clone());
                 }
-                markdown::render_message_content(
-                    ui,
-                    &msg.content,
-                    lookup,
-                    font_size,
-                    msg.id.0 as usize,
-                    &mut chat_state.spoilers_revealed,
-                );
+                // Jumbo emoji: a message that is ONLY emoji renders huge
+                // (Discord's 47px single-emoji rule; 2-3 get 30px).
+                if let Some(jumbo_px) = jumbo_emoji_size(&msg.content, lookup) {
+                    render_jumbo_emoji(ui, &msg.content, lookup, jumbo_px);
+                } else {
+                    markdown::render_message_content(
+                        ui,
+                        &msg.content,
+                        lookup,
+                        font_size,
+                        msg.id.0 as usize,
+                        &mut chat_state.spoilers_revealed,
+                    );
+                }
+                // Stickers: image + name under the content.
+                for st in &msg.sticker_items {
+                    ui.add_space(4.0);
+                    let size = egui::vec2(160.0, 160.0);
+                    let (_rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                    crate::image_loader::render_image_size(ui, &st.url(), size, crate::image_loader::Shape::Rounded(8));
+                    let _ = resp;
+                    ui.label(
+                        egui::RichText::new(format!(". {} - Discord", st.name))
+                            .size(11.0)
+                            .color(colors::TEXT_TERTIARY),
+                    );
+                }
+                // YouTube link: full video embed card (oEmbed).
+                let yt = crate::ui::youtube::find_link(&msg.content);
+                if let Some((vid, url)) = yt.as_ref() {
+                    crate::ui::youtube::render(ui, app_state, url, vid);
+                }
                 if msg.edited_timestamp.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
                     ui.label(
                         egui::RichText::new("(edited)")
@@ -711,7 +780,7 @@ fn render_message_row(
                     render_attachments(ui, msg);
                 }
                 if !msg.embeds.is_empty() {
-                    render_embeds(ui, msg, font_size, lookup);
+                    render_embeds(ui, msg, font_size, lookup, yt.as_ref().map(|(_, u)| u.as_str()));
                 }
                 if !msg.reactions.is_empty() {
                     render_reactions(ui, msg, rest.clone());
@@ -779,13 +848,24 @@ fn render_attachments(ui: &mut Ui, msg: &Message) {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             for a in images {
-                let w = a.width.unwrap_or(200).min(300) as f32;
-                crate::image_loader::render_image(
-                    ui,
-                    &a.url,
-                    w,
-                    crate::image_loader::Shape::Rounded(6),
-                );
+                // Real aspect ratio, capped like Discord (max ~400x300).
+                let size = crate::image_loader::fit_size(a.width, a.height, 400.0, 300.0);
+                let is_gif = a.content_type.as_deref() == Some("image/gif")
+                    || a.filename.to_ascii_lowercase().ends_with(".gif");
+                let url = a.url.clone();
+                let (rect, _) = ui.allocate_exact_size(size, Sense::click());
+                crate::image_loader::render_image_size(ui, &url, size, crate::image_loader::Shape::Rounded(6));
+                let painter = ui.painter_at(rect);
+                // Click opens the full-size file in the browser.
+                if ui
+                    .interact(rect, ui.id().with(("att", a.id.0)), Sense::click())
+                    .clicked()
+                {
+                    let _ = open::that_detached(&url);
+                }
+                if is_gif {
+                    paint_gif_chip(&painter, rect);
+                }
             }
         });
     }
@@ -871,8 +951,16 @@ fn render_embed_header(ui: &mut Ui, e: &crate::model::Embed) {
     }
 }
 
-fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32, lookup: &StateLookup<'_>) {
+#[allow(clippy::too_many_arguments)]
+fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32, lookup: &StateLookup<'_>, yt_url: Option<&str>) {
     for e in &msg.embeds {
+        // We render a richer dedicated card for YouTube links; skip the
+        // raw unfurl of the SAME url so the video never shows twice.
+        if let (Some(yt), Some(eu)) = (yt_url, e.url.as_deref()) {
+            if eu == yt {
+                continue;
+            }
+        }
         // Discord's embed: a dark card with a single 4px color stripe on the
         // LEFT edge only (the old full-border stroke boxed the whole card
         // in blue).
@@ -964,7 +1052,8 @@ fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32, lookup: &StateLooku
                     );
                 }
                 // Big embed media (link unfurls, GIF posts): the image
-                // Discord shows large under the description.
+                // Discord shows large under the description, with a GIF
+                // chip when it is one.
                 if let Some(img) = e.image.as_ref() {
                     if let Some(url) = img.proxy_url.as_ref().or(Some(&img.url)) {
                         ui.add_space(4.0);
@@ -974,12 +1063,18 @@ fn render_embeds(ui: &mut Ui, msg: &Message, font_size: f32, lookup: &StateLooku
                             384.0,
                             384.0,
                         );
+                        let is_gif = url.to_ascii_lowercase().contains(".gif");
+                        let (rect, _) = ui.allocate_exact_size(size, Sense::click());
                         crate::image_loader::render_image_size(
                             ui,
                             url,
                             size,
                             crate::image_loader::Shape::Rounded(6),
                         );
+                        if is_gif {
+                            let painter = ui.painter_at(rect);
+                            paint_gif_chip(&painter, rect);
+                        }
                     }
                 }
             });
@@ -1037,6 +1132,173 @@ fn render_reactions(ui: &mut Ui, msg: &Message, _rest: Arc<crate::rest::Http>) {
     });
 }
 
+// ───────────────────────── jumbo emoji / gif chip / reply ref ────────
+
+/// Size for an all-emoji message: 1 emoji = 46px, 2-3 = 30px, else None.
+/// Raw unicode clusters AND custom `<:name:id>` mentions count.
+fn jumbo_emoji_size(content: &str, lookup: &dyn crate::markdown::MentionLookup) -> Option<f32> {
+    let tokens = crate::markdown::parse(content, lookup);
+    let mut emoji = 0usize;
+    for t in &tokens {
+        match t {
+            crate::markdown::Token::CustomEmoji { .. } | crate::markdown::Token::UnicodeEmoji { .. } => {
+                emoji += 1;
+            }
+            // Raw emoji clusters arrive as Text runs: segment them.
+            crate::markdown::Token::Text(text) => {
+                for seg in crate::ui::emoji::segment(text) {
+                    match seg {
+                        crate::ui::emoji::Seg::Emoji(_) => emoji += 1,
+                        crate::ui::emoji::Seg::Text(t2) if t2.trim().is_empty() => {}
+                        crate::ui::emoji::Seg::Text(_) => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    match emoji {
+        1 => Some(46.0),
+        2..=3 => Some(30.0),
+        _ => None,
+    }
+}
+
+/// Render an all-emoji message at jumbo size.
+fn render_jumbo_emoji(ui: &mut Ui, content: &str, lookup: &dyn crate::markdown::MentionLookup, size: f32) {
+    let tokens = crate::markdown::parse(content, lookup);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        for t in tokens {
+            match t {
+                crate::markdown::Token::CustomEmoji { url, name, .. } => {
+                    crate::image_loader::render_emoji(ui, &url, size, &name);
+                }
+                crate::markdown::Token::UnicodeEmoji { unicode, .. } => {
+                    let url = crate::ui::emoji::twemoji_url(&unicode);
+                    let fallback = crate::ui::emoji::twemoji_url_vs16(&unicode);
+                    crate::image_loader::render_emoji_inline(ui, &url, &fallback, size, &unicode);
+                }
+                // Raw unicode clusters from Text runs.
+                crate::markdown::Token::Text(text) => {
+                    for seg in crate::ui::emoji::segment(&text) {
+                        if let crate::ui::emoji::Seg::Emoji(cluster) = seg {
+                            let url = crate::ui::emoji::twemoji_url(&cluster);
+                            let fallback = crate::ui::emoji::twemoji_url_vs16(&cluster);
+                            crate::image_loader::render_emoji_inline(
+                                ui,
+                                &url,
+                                &fallback,
+                                size,
+                                &cluster,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// The "GIF" chip Discord paints at the bottom-left corner of gif media.
+fn paint_gif_chip(painter: &egui::Painter, rect: Rect) {
+    let chip = Rect::from_min_size(
+        rect.left_bottom() + egui::vec2(8.0, -22.0),
+        egui::vec2(30.0, 14.0),
+    );
+    painter.rect_filled(chip, 3.0, egui::Color32::from_black_alpha(160));
+    painter.text(
+        chip.center(),
+        egui::Align2::CENTER_CENTER,
+        "GIF",
+        egui::FontId::proportional(10.0),
+        colors::TEXT_PRIMARY,
+    );
+}
+
+/// Discord-style reply header: curve line + mini avatar + name + snippet
+/// of the message being replied to.
+fn render_reply_reference(ui: &mut Ui, app_state: &AppState, msg: &Message, rest: Arc<crate::rest::Http>) {
+    // Prefer the embedded referenced_message; fall back to the fetched
+    // cache; else kick a background fetch for it.
+    let referenced: Option<crate::model::Message> = msg
+        .referenced_message
+        .as_ref()
+        .map(|m| (**m).clone())
+        .or_else(|| {
+            msg.message_reference
+                .as_ref()
+                .and_then(|r| r.message_id)
+                .and_then(|id| {
+                    let cached = app_state.referenced_message(id);
+                    if cached.is_none() {
+                        // Fetch once (dedup via the cache insert itself).
+                        let cid = msg.channel_id;
+                        let rest = rest.clone();
+                        tokio::spawn(async move {
+                            if let Ok(m) = rest.get_message(cid, id).await {
+                                if let Some(s) = crate::state::global() {
+                                    s.set_referenced_message(&m);
+                                    let _ = s.event_sender().send(
+                                        crate::gateway::events::Event::RepaintRequested,
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    cached
+                })
+        });
+
+    ui.horizontal(|ui| {
+        // Vertical connector + horizontal hook.
+        let (line_rect, _) = ui.allocate_exact_size(egui::vec2(2.0, 16.0), Sense::hover());
+        let p = ui.painter_at(line_rect);
+        p.rect_filled(
+            Rect::from_min_size(line_rect.min, egui::vec2(2.0, 16.0)),
+            1.0,
+            colors::TEXT_MUTED,
+        );
+        let (hook, _) = ui.allocate_exact_size(egui::vec2(12.0, 2.0), Sense::hover());
+        ui.painter_at(hook).rect_filled(
+            Rect::from_min_size(egui::pos2(hook.min.x, hook.min.y + 14.0), egui::vec2(12.0, 2.0)),
+            1.0,
+            colors::TEXT_MUTED,
+        );
+        ui.add_space(6.0);
+        let (name, snippet, avatar_url) = match &referenced {
+            Some(r) => (
+                r.author.display_name().to_string(),
+                r.content.chars().take(64).collect::<String>(),
+                r.author.avatar_url(),
+            ),
+            None => (
+                "original message".to_string(),
+                "Click to see the original message".to_string(),
+                String::new(),
+            ),
+        };
+        crate::image_loader::render_avatar(ui, &avatar_url, 16.0, &name, None);
+        ui.label(
+            egui::RichText::new(name)
+                .color(colors::TEXT_LINK)
+                .size(12.5)
+                .strong(),
+        );
+        if !snippet.is_empty() {
+            let short: String = snippet.chars().take(80).collect();
+            let suffix = if snippet.chars().count() > 80 { "..." } else { "" };
+            ui.label(
+                egui::RichText::new(format!("{short}{suffix}"))
+                    .color(colors::TEXT_TERTIARY)
+                    .size(12.0),
+            );
+        }
+    });
+    ui.add_space(2.0);
+}
+
 // ───────────────────────────── composer ─────────────────────────────
 
 fn render_composer(
@@ -1045,8 +1307,45 @@ fn render_composer(
     sender: &tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
     chat_state: &mut ChatState,
     channel: Option<&Channel>,
+    config: &mut crate::config::Config,
 ) {
     let cid = channel.map(|c| c.id);
+
+    // Send-lock banner (Discord blocked sending): loud, persistent, and
+    // only the user can clear it. Never auto-retried, never auto-cleared.
+    if let Some(reason) = app_state.send_lock_reason() {
+        let banner_h = 40.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), banner_h), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 6.0, colors::RED.gamma_multiply(0.25));
+        let text_rect = Rect::from_min_max(
+            egui::pos2(rect.min.x + 16.0, rect.min.y),
+            egui::pos2(rect.max.x - 130.0, rect.max.y),
+        );
+        painter.text(
+            text_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            format!("{reason}. Sending is stopped for your account's safety."),
+            egui::FontId::proportional(12.5),
+            colors::RED,
+        );
+        let btn = Rect::from_center_size(rect.right_center() - egui::vec2(58.0, 0.0), egui::vec2(92.0, 26.0));
+        let resp = ui
+            .interact(btn, ui.id().with("send_lock_retry"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        painter.rect_filled(btn, 6.0, colors::RED);
+        painter.text(
+            btn.center(),
+            egui::Align2::CENTER_CENTER,
+            "Retry sending",
+            egui::FontId::proportional(12.0),
+            colors::TEXT_PRIMARY,
+        );
+        if resp.clicked() {
+            app_state.clear_send_lock();
+            crate::ui::toast::success("Sending re-enabled. Your next message will send normally.");
+        }
+    }
 
     // Reply context bar.
     if let Some(target) = chat_state.reply_to {
@@ -1056,21 +1355,45 @@ fn render_composer(
         if let Some(target_msg) = messages.iter().find(|m| m.id == target) {
             let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
             let painter = ui.painter_at(bar_rect);
+            // Connector hook from the composer to the row above.
             painter.rect_filled(
                 Rect::from_min_size(egui::pos2(bar_rect.min.x + 40.0, bar_rect.max.y - 2.0), egui::vec2(40.0, 2.0)),
                 1.0,
                 colors::TEXT_MUTED,
             );
+            // Mini avatar + name + snippet, like the official client.
+            let avatar_rect = Rect::from_center_size(
+                egui::pos2(bar_rect.min.x + 66.0, bar_rect.center().y),
+                Vec2::splat(16.0),
+            );
+            let url = target_msg.author.avatar_url();
+            crate::image_loader::render_avatar(
+                ui,
+                &url,
+                16.0,
+                target_msg.author.display_name(),
+                None,
+            );
+            let _ = avatar_rect;
+            let text_x = bar_rect.min.x + 80.0;
+            let snippet: String = target_msg.content.chars().take(60).collect();
+            let snippet: String = snippet.chars().filter(|c| *c != '\n').take(60).collect();
+            let label = if snippet.is_empty() {
+                format!("Replying to {}", target_msg.author.display_name())
+            } else {
+                format!("Replying to {}: {}", target_msg.author.display_name(), snippet)
+            };
+            let label: String = label.chars().take(90).collect();
             painter.text(
-                egui::pos2(bar_rect.min.x + 88.0, bar_rect.center().y),
+                egui::pos2(text_x, bar_rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                format!("Replying to {}", target_msg.author.display_name()),
+                label,
                 egui::FontId::proportional(12.0),
                 colors::TEXT_LINK,
             );
             // Cancel button.
             let x_rect = Rect::from_center_size(
-                egui::pos2(bar_rect.min.x + 66.0, bar_rect.center().y),
+                egui::pos2(bar_rect.max.x - 24.0, bar_rect.center().y),
                 Vec2::splat(18.0),
             );
             let resp = ui
@@ -1145,32 +1468,110 @@ fn render_composer(
         frame.show(ui, |ui| {
             ui.set_width(card_w - 12.0);
             ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut chat_state.input)
-                        .desired_width(ui.available_width() - 44.0)
-                        .hint_text(match channel {
-                            Some(c) => match c.kind {
-                                crate::model::ChannelType::Dm | crate::model::ChannelType::GroupDm => {
-                                    format!("Message {}", c.display_name())
-                                }
-                                _ => format!("Message #{}", c.name),
-                            },
-                            None => "Select a channel first".to_string(),
-                        })
-                        .text_color(colors::TEXT_PRIMARY),
-                );
+                // ── Left: the + (attach) button ──
+                {
+                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                    let resp = resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Attach a file");
+                    let c = if resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_SECONDARY };
+                    let painter = ui.painter_at(r);
+                    painter.circle_stroke(r.center(), 11.0, egui::Stroke::new(1.6, c));
+                    painter.line_segment(
+                        [egui::pos2(r.center().x - 5.0, r.center().y), egui::pos2(r.center().x + 5.0, r.center().y)],
+                        egui::Stroke::new(1.6, c),
+                    );
+                    painter.line_segment(
+                        [egui::pos2(r.center().x, r.center().y - 5.0), egui::pos2(r.center().x, r.center().y + 5.0)],
+                        egui::Stroke::new(1.6, c),
+                    );
+                    if resp.clicked() {
+                        pick_and_upload_attachment(app_state, cid);
+                    }
+                }
+                ui.add_space(2.0);
+
+                // ── Text input ──
+                // enter_to_send = true (default): single-line, Enter sends,
+                // Shift+Enter does nothing (exactly-once guarantee pinned
+                // by the security tests). enter_to_send = false: multi-line
+                // grows, Enter is a newline, Ctrl+Enter sends.
+                let can_send = channel.is_some() && !chat_state.input.trim().is_empty();
+                let mut enter_pressed = false;
+                let mut ctrl_enter_pressed = false;
+                let response = if config.enter_to_send {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut chat_state.input)
+                            .desired_width(ui.available_width() - 170.0)
+                            .hint_text(match channel {
+                                Some(c) => match c.kind {
+                                    crate::model::ChannelType::Dm | crate::model::ChannelType::GroupDm => {
+                                        format!("Message {}", c.display_name())
+                                    }
+                                    _ => format!("Message #{}", c.name),
+                                },
+                                None => "Select a channel first".to_string(),
+                            })
+                            .text_color(colors::TEXT_PRIMARY),
+                    )
+                } else {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut chat_state.input)
+                            .desired_rows(1)
+                            .desired_width(ui.available_width() - 170.0)
+                            .hint_text("Message - Enter for newline, Ctrl+Enter to send")
+                            .text_color(colors::TEXT_PRIMARY),
+                    )
+                };
+                // Detect Ctrl+Enter BEFORE any consume (multiline path).
+                if !config.enter_to_send {
+                    ctrl_enter_pressed = ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::CTRL, Key::Enter)
+                    });
+                }
                 if chat_state.want_composer_focus && channel.is_some() {
                     response.request_focus();
                     chat_state.want_composer_focus = false;
                 }
 
+                // ── Right: gift / gif / sticker / emoji / send ──
+                for (kind, icon, tooltip) in [
+                    (ComposerPopup::Gift, "redeem", "Gift Nitro"),
+                    (ComposerPopup::GifUrl, "movie", "Send a GIF by URL"),
+                    (ComposerPopup::Sticker, "mystery", "Stickers"),
+                    (ComposerPopup::Emoji, "mood", "Emoji"),
+                ] {
+                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                    let active = chat_state.composer_popup == kind;
+                    let resp = resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(tooltip);
+                    let c = if active || resp.hovered() { colors::TEXT_PRIMARY } else { colors::TEXT_SECONDARY };
+                    crate::icons::draw(ui.painter(), icon, r.center(), 20.0, c);
+                    if resp.clicked() {
+                        if active {
+                            chat_state.composer_popup = ComposerPopup::None;
+                            chat_state.composer_popup_opened = None;
+                        } else {
+                            chat_state.composer_popup = kind;
+                            chat_state.composer_popup_opened = Some(std::time::Instant::now());
+                            if kind == ComposerPopup::Sticker {
+                                if let (Some(rest), Some(gid)) =
+                                    (crate::rest::global(), channel.and_then(|c| c.guild_id))
+                                {
+                                    fetch_guild_stickers(rest, gid);
+                                }
+                            }
+                        }
+                        chat_state.picker_search.clear();
+                    }
+                }
                 // Send button.
-                let can_send = channel.is_some() && !chat_state.input.trim().is_empty();
                 let (s_rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
                 let send_resp = ui
                     .interact(s_rect, ui.id().with("composer_send"), Sense::click())
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("Send");
+                    .on_hover_text(if config.enter_to_send { "Send (Enter)" } else { "Send (Ctrl+Enter)" });
                 let sc = if can_send || send_resp.hovered() {
                     colors::BLURPLE
                 } else {
@@ -1192,19 +1593,31 @@ fn render_composer(
                 // must own focus (or have just lost it to this very press) so
                 // Enter presses aimed at other widgets (search box, modal)
                 // never send messages.
-                let composer_focused = response.has_focus() || response.lost_focus();
-                if composer_focused {
-                    let enter = ui.input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, Key::Enter)
-                    });
-                    if enter {
-                        chat_state.send_error = None;
-                        if can_send {
-                            send_current(sender, chat_state, cid);
+                if config.enter_to_send {
+                    let composer_focused = response.has_focus() || response.lost_focus();
+                    if composer_focused {
+                        let enter = ui.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, Key::Enter)
+                        });
+                        if enter {
+                            enter_pressed = true;
                         }
-                        // Discord keeps the composer focused after sending.
-                        response.request_focus();
                     }
+                }
+                // One physical keypress = at most one send. The exact
+                // gating: enter_to_send -> Enter; otherwise -> Ctrl+Enter.
+                let should_send = if config.enter_to_send {
+                    enter_pressed
+                } else {
+                    ctrl_enter_pressed
+                };
+                if should_send {
+                    chat_state.send_error = None;
+                    if can_send {
+                        send_current(sender, chat_state, cid);
+                    }
+                    // Discord keeps the composer focused after sending.
+                    response.request_focus();
                 }
                 // Any edit to the input dismisses a stale send error.
                 if response.changed() {
@@ -1214,6 +1627,396 @@ fn render_composer(
         });
     });
     ui.add_space(10.0);
+
+    // ── Composer popups (emoji / sticker / gift / gif) ──
+    render_composer_popup(ui, app_state, chat_state, channel, sender);
+}
+
+/// Fetch + cache guild stickers once per session.
+fn fetch_guild_stickers(rest: Arc<crate::rest::Http>, guild_id: Snowflake) {
+    static INFLIGHT: once_cell::sync::Lazy<dashmap::DashSet<u64>> =
+        once_cell::sync::Lazy::new(dashmap::DashSet::new);
+    if !INFLIGHT.insert(guild_id.0) {
+        return;
+    }
+    tokio::spawn(async move {
+        match rest.get_guild_stickers(guild_id).await {
+            Ok(stickers) => {
+                // Stickers ride on the guild model for the picker.
+                if let Some(s) = crate::state::global() {
+                    let mut guilds = s.guilds.write();
+                    if let Some(g) = guilds.iter_mut().find(|g| g.id == guild_id) {
+                        g.stickers = stickers;
+                    }
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "stickers fetch failed"),
+        }
+    });
+}
+/// The composer right-side popup: emoji picker (custom + unicode with
+/// search), stickers, gift (honest Nitro notice) and gif-by-URL.
+#[allow(clippy::too_many_arguments)]
+fn render_composer_popup(
+    ui: &mut Ui,
+    app_state: &AppState,
+    chat_state: &mut ChatState,
+    channel: Option<&Channel>,
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
+) {
+    if chat_state.composer_popup == ComposerPopup::None {
+        return;
+    }
+    let vp = ui.ctx().viewport_rect();
+    let w = 380.0;
+    let h = 320.0;
+    // Above the composer, right-aligned (right of the emoji button).
+    let pos = egui::pos2((vp.max.x - w - 28.0).max(vp.min.x + 4.0), (vp.max.y - h - 92.0).max(vp.min.y + 8.0));
+    let area_rect = Rect::from_min_size(pos, egui::vec2(w, h));
+    let frame = egui::Frame::new()
+        .fill(colors::BG_FLOATING)
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::same(10))
+        .stroke(egui::Stroke::new(1.0, colors::BG_INPUT));
+    let mut close = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let in_grace = chat_state
+        .composer_popup_opened
+        .map(|t| t.elapsed() < std::time::Duration::from_millis(250))
+        .unwrap_or(true);
+    let mut inserted: Option<String> = None;
+    let mut send_gif: Option<String> = None;
+    egui::Area::new(egui::Id::new("composer_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(area_rect.min)
+        .interactable(true)
+        .show(ui.ctx(), |ui| {
+            frame.show(ui, |ui| {
+                ui.set_width(w - 20.0);
+                ui.set_min_height(h - 20.0);
+                ui.vertical(|ui| {
+                    match chat_state.composer_popup {
+                        ComposerPopup::Emoji => {
+                            ui.label(
+                                egui::RichText::new("Emoji").size(13.0).strong().color(colors::TEXT_PRIMARY),
+                            );
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut chat_state.picker_search)
+                                    .desired_width(ui.available_width())
+                                    .hint_text("Search emoji")
+                                    .font(egui::FontId::proportional(12.5)),
+                            );
+                            resp.request_focus();
+                            ui.add_space(4.0);
+                            let needle = chat_state.picker_search.trim().to_lowercase();
+                            // Server custom emoji first.
+                            let gid = channel.and_then(|c| c.guild_id);
+                            let custom: Vec<crate::model::Emoji> = gid
+                                .map(|g| app_state.guild_emojis(g))
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|e| needle.is_empty() || e.name.to_lowercase().contains(&needle))
+                                .collect();
+                            if !custom.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!("Server emoji - {}", custom.len()))
+                                        .size(11.0)
+                                        .color(colors::TEXT_TERTIARY),
+                                );
+                                emoji_grid(ui, &custom, 34.0, &mut inserted, |e| e.mention());
+                            }
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Standard").size(11.0).color(colors::TEXT_TERTIARY),
+                            );
+                            let unicode: Vec<(&str, &str)> = crate::ui::emoji::PICKER_SET
+                                .iter()
+                                .copied()
+                                .filter(|(name, _)| needle.is_empty() || name.contains(&needle))
+                                .collect();
+                            unicode_grid(ui, &unicode, 30.0, &mut inserted);
+                        }
+                        ComposerPopup::Sticker => {
+                            ui.label(
+                                egui::RichText::new("Stickers").size(13.0).strong().color(colors::TEXT_PRIMARY),
+                            );
+                            ui.add_space(4.0);
+                            let gid = channel.and_then(|c| c.guild_id);
+                            let stickers = gid
+                                .and_then(|g| app_state.guild_by_id(g))
+                                .map(|g| g.stickers.clone())
+                                .unwrap_or_default();
+                            if stickers.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("This server has no stickers. Guild stickers you can use appear here.")
+                                        .size(12.0)
+                                        .color(colors::TEXT_TERTIARY),
+                                );
+                            } else {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    for st in &stickers {
+                                        let resp = ui
+                                            .horizontal(|ui| {
+                                                crate::image_loader::render_image(
+                                                    ui,
+                                                    &st.url(),
+                                                    64.0,
+                                                    crate::image_loader::Shape::Rounded(8),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(&st.name)
+                                                        .size(12.5)
+                                                        .color(colors::TEXT_PRIMARY),
+                                                );
+                                            })
+                                            .response;
+                                        if resp.clicked() {
+                                            send_sticker(sender, channel, st);
+                                            close = true;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        ComposerPopup::Gift => {
+                            ui.label(
+                                egui::RichText::new("Gift Nitro").size(13.0).strong().color(colors::TEXT_PRIMARY),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Gifting needs the Discord checkout flow, which lives behind the\nstore API for user accounts. Basalt is a bot-token client, so\ngifting is out of scope - nothing was purchased, nothing was sent.",
+                                )
+                                .size(12.5)
+                                .color(colors::TEXT_SECONDARY),
+                            );
+                        }
+                        ComposerPopup::GifUrl => {
+                            ui.label(
+                                egui::RichText::new("Send a GIF by URL").size(13.0).strong().color(colors::TEXT_PRIMARY),
+                            );
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut chat_state.gif_url_input)
+                                    .desired_width(ui.available_width())
+                                    .hint_text("https://media.tenor.com/...")
+                                    .font(egui::FontId::proportional(12.5)),
+                            );
+                            resp.request_focus();
+                            ui.add_space(6.0);
+                            let can = chat_state.gif_url_input.trim().starts_with("http");
+                            let btn = ui.add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::new(
+                                    egui::RichText::new("Send GIF link").size(12.5).color(colors::TEXT_PRIMARY),
+                                )
+                                .fill(if can { colors::BLURPLE } else { colors::BG_ACCENT }),
+                            );
+                            if btn.clicked() && can {
+                                send_gif = Some(chat_state.gif_url_input.trim().to_string());
+                            }
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can {
+                                send_gif = Some(chat_state.gif_url_input.trim().to_string());
+                            }
+                        }
+                        ComposerPopup::None => {}
+                    }
+                });
+            });
+        });
+    let outside = !in_grace
+        && ui.input(|i| {
+            i.pointer.button_clicked(egui::PointerButton::Primary)
+                && i.pointer
+                    .interact_pos()
+                    .map(|p| !area_rect.contains(p))
+                    .unwrap_or(false)
+        });
+    if let Some(emoji_text) = inserted {
+        chat_state.input.push_str(&emoji_text);
+        chat_state.want_composer_focus = true;
+    }
+    if let Some(gif) = send_gif {
+        chat_state.input = gif;
+        chat_state.want_composer_focus = true;
+        if let Some(cid) = channel.map(|c| c.id) {
+            send_current(sender, chat_state, Some(cid));
+        }
+    }
+    if close || outside {
+        chat_state.composer_popup = ComposerPopup::None;
+        chat_state.composer_popup_opened = None;
+        chat_state.picker_search.clear();
+        chat_state.gif_url_input.clear();
+    }
+}
+
+/// Grid of custom server emoji for the picker.
+fn emoji_grid(
+    ui: &mut Ui,
+    emojis: &[crate::model::Emoji],
+    cell: f32,
+    inserted: &mut Option<String>,
+    mention_of: impl Fn(&crate::model::Emoji) -> String,
+) {
+    let cols = ((ui.available_width() / (cell + 6.0)).floor().max(1.0)) as usize;
+    let mut row: Vec<crate::model::Emoji> = Vec::new();
+    let mut flushed = 0usize;
+    for e in emojis {
+        row.push(e.clone());
+        flushed += 1;
+        if row.len() >= cols || flushed == emojis.len() {
+            let row_owned = row.clone();
+            let ui_row = ui.horizontal(|ui| {
+                for e in &row_owned {
+                    if crate::image_loader::render_emoji_cell(ui, &e.url(), cell, &e.name) {
+                        *inserted = Some(mention_of(e));
+                    }
+                }
+                for _ in row_owned.len()..cols {
+                    ui.allocate_exact_size(Vec2::splat(cell), Sense::hover());
+                }
+            });
+            let _ = ui_row;
+            row.clear();
+        }
+    }
+}
+
+/// Grid of unicode emoji for the picker.
+fn unicode_grid(ui: &mut Ui, set: &[(&str, &str)], cell: f32, inserted: &mut Option<String>) {
+    let cols = ((ui.available_width() / (cell + 4.0)).floor().max(1.0)) as usize;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(190.0)
+        .show(ui, |ui| {
+            for chunk in set.chunks(cols) {
+                ui.horizontal(|ui| {
+                    for (_, cluster) in chunk {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(cell), Sense::click());
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        crate::ui::emoji::draw_emoji_at(ui, rect, cluster);
+                        if resp.clicked() {
+                            *inserted = Some(cluster.to_string());
+                        }
+                    }
+                });
+            }
+        });
+}
+
+/// Send a sticker message (single sticker, no content).
+fn send_sticker(
+    sender: &tokio::sync::mpsc::UnboundedSender<crate::sender::SendRequest>,
+    channel: Option<&Channel>,
+    sticker: &crate::model::StickerItem,
+) {
+    let Some(ch) = channel else { return };
+    let nonce = crate::state::new_nonce();
+    let nonce_str = nonce.0.to_string();
+    let body = CreateMessageBody {
+        content: None,
+        nonce: Some(nonce_str.clone()),
+        tts: Some(false),
+        embeds: Vec::new(),
+        attachments: Vec::new(),
+        message_reference: None,
+        flags: None,
+        sticker_ids: vec![sticker.id.0.to_string()],
+        allowed_mentions: None,
+    };
+    let _ = sender.send((ch.id, body, nonce_str));
+}
+
+/// Open the file dialog, then upload exactly one attachment. One click =
+/// one POST, never retried; the optimistic echo shows it immediately.
+fn pick_and_upload_attachment(app_state: &AppState, cid: Option<Snowflake>) {
+    let Some(cid) = cid else { return };
+    if app_state.send_lock_reason().is_some() {
+        crate::ui::toast::error("Sending is paused (Discord block). Clear it with Retry first.");
+        return;
+    }
+    let task = rfd::AsyncFileDialog::new()
+        .set_title("Attach a file")
+        .pick_file();
+    tokio::spawn(async move {
+        let Some(handle) = task.await else { return };
+        let path = handle.path().to_path_buf();
+        let name = handle.file_name();
+        let bytes = match tokio::task::spawn_blocking(move || std::fs::read(&path))
+            .await
+        {
+            Ok(Ok(b)) => Some(b),
+            _ => None,
+        };
+        let Some(bytes) = bytes else {
+            crate::ui::toast::error("Could not read that file.");
+            return;
+        };
+        if bytes.len() > 8 * 1024 * 1024 {
+            crate::ui::toast::error("File is larger than 8 MiB - Discord's bot upload limit.");
+            return;
+        }
+        if !crate::sender::reserve_send_slot() {
+            crate::ui::toast::error("Local rate cap reached. Nothing was uploaded.");
+            return;
+        }
+        let Some(rest) = crate::rest::global() else { return };
+        if crate::state::global().and_then(|s| s.send_lock_reason()).is_some() {
+            crate::ui::toast::error("Sending is paused (Discord block).");
+            return;
+        }
+        // Optimistic echo with the filename while it uploads.
+        let nonce = crate::state::new_nonce();
+        let nonce_str = nonce.0.to_string();
+        if let Some(s) = crate::state::global() {
+            let author = s.current_user().unwrap_or_default();
+            s.insert_pending_message(
+                cid,
+                &crate::model::Message {
+                    id: nonce,
+                    channel_id: cid,
+                    author,
+                    content: String::new(),
+                    nonce: Some(nonce_str.clone()),
+                    attachments: vec![crate::model::Attachment {
+                        id: crate::model::Snowflake(0),
+                        filename: name.clone(),
+                        size: bytes.len() as u64,
+                        url: String::new(),
+                        proxy_url: None,
+                        content_type: Some(crate::rest::guess_mime(&name).to_string()),
+                        width: None,
+                        height: None,
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let body = CreateMessageBody {
+            content: Some(String::new()),
+            nonce: Some(nonce_str.clone()),
+            tts: Some(false),
+            embeds: Vec::new(),
+            attachments: Vec::new(),
+            message_reference: None,
+            flags: None,
+            sticker_ids: Vec::new(),
+            allowed_mentions: None,
+        };
+        // Exactly one POST, never retried (same rule as the send queue).
+        match rest.post_message_attachment(cid, &body, &name, bytes).await {
+            Ok(created) => {
+                if let Some(s) = crate::state::global() {
+                    s.resolve_pending(cid, &nonce_str, created);
+                }
+            }
+            Err(e) => {
+                let msg = format!("Upload failed: {e}. Your file was not sent.");
+                if let Some(s) = crate::state::global() {
+                    s.fail_pending(cid, &nonce_str, msg);
+                }
+            }
+        }
+    });
 }
 
 fn send_current(
@@ -1270,6 +2073,7 @@ fn send_current(
             guild_id: None,
         }),
         flags: None,
+        sticker_ids: Vec::new(),
         allowed_mentions: Some(AllowedMentions {
             parse: vec!["users".into(), "roles".into()],
             ..Default::default()
@@ -1620,10 +2424,11 @@ mod send_tests {
             ..Default::default()
         };
         let ch = test_channel();
+        let mut cfg = crate::config::Config::default();
         ctx.set_fonts(egui::FontDefinitions::empty());
         let output = ctx.run_ui(input, |ui| {
             ui.set_min_size(egui::vec2(900.0, 700.0));
-            super::render_composer(ui, app, sender, chat, Some(&ch));
+            super::render_composer(ui, app, sender, chat, Some(&ch), &mut cfg);
         });
         // Like egui's own __run_test_ui: discard textures without applying.
         output.drop_without_applying_deltas();

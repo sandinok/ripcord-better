@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 
-pub use client::{Http, HttpError};
+pub use client::{guess_mime, Http, HttpError};
 
 /// Process-wide handle to the shared Http client, registered by the app at
 /// startup so UI modules (members panel, resolvers) can fire requests
@@ -27,4 +27,17 @@ pub fn install_global(http: Arc<Http>) -> Result<(), Arc<Http>> {
 
 pub fn global() -> Option<Arc<Http>> {
     GLOBAL_HTTP.get().cloned()
+}
+
+/// A bare JSON-capable HTTP client for non-Discord APIs (YouTube oEmbed,
+/// release checks). No auth, no rate limiting.
+pub fn plain_client() -> reqwest::Client {
+    static PLAIN: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+        reqwest::Client::builder()
+            .user_agent(crate::identity::image_user_agent())
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("plain http client init")
+    });
+    PLAIN.clone()
 }
