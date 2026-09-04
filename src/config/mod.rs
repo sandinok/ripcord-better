@@ -96,6 +96,11 @@ pub struct Config {
     /// One-shot startup notice (updater result), never persisted.
     #[serde(skip)]
     pub startup_notice: Option<String>,
+
+    /// The file this config was loaded from (defaults to [`default_path`]).
+    /// `save()` writes back to the same path so `--config` round-trips.
+    #[serde(skip)]
+    pub path: Option<PathBuf>,
 }
 
 /// A server folder in the guild bar.
@@ -158,6 +163,7 @@ impl Default for Config {
             notification_sounds: default_true(),
             desktop_notifications: default_true(),
             startup_notice: None,
+            path: None,
         }
     }
 }
@@ -183,6 +189,7 @@ impl Config {
         } else {
             Config::default()
         };
+        cfg.path = path;
 
         // Env override has the lowest priority.
         if cfg.token.is_none() {
@@ -210,6 +217,10 @@ impl Config {
                     Ok(envelope) => {
                         cfg.token = Some(envelope);
                         tracing::info!("legacy plaintext token migrated to the OS secret store");
+                        // Persist the migration NOW: the plaintext must not
+                        // survive on disk past this load, even if the app
+                        // never saves again this session.
+                        let _ = cfg.save();
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "could not migrate token to the OS store");
@@ -268,8 +279,13 @@ impl Config {
     }
 
     /// Persist the config to disk. Creates the parent directory if needed.
+    /// Writes back to the file the config was loaded from (honors
+    /// `--config`), defaulting to [`default_path`].
     pub fn save(&self) -> Result<()> {
-        let path = default_path()?
+        let path = self
+            .path
+            .clone()
+            .or_else(|| default_path().ok().flatten())
             .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -324,26 +340,107 @@ mod tests {
     #[test]
     fn legacy_plain_token_migrates_to_envelope() {
         // A pre-0.2 config with a plaintext token must come back sealed.
-        let toml_str = "token = \"definitely-a-legacy-plaintext-value\"\nshow_members = true\n";
-        let mut c: Config = toml::from_str(toml_str).unwrap_or_default();
-        // Simulate load()'s migration branch.
-        if let Some(stored) = c.token.clone() {
-            if !stored.starts_with("dpapi:")
-                && !stored.starts_with("keychain:")
-                && !stored.starts_with("file:")
-            {
-                if let Ok(env) = secrets::seal(stored.trim()) {
-                    c.token = Some(env);
+        // Runs hermetically: XDG_CONFIG_HOME is pointed at a scratch dir so
+        // `secrets::seal` never touches (or clobbers) a real install's
+        // token file.
+        with_scratch_config_home(|| {
+            let toml_str = "token = \"definitely-a-legacy-plaintext-value\"\nshow_members = true\n";
+            let mut c: Config = toml::from_str(toml_str).unwrap_or_default();
+            // Simulate load()'s migration branch.
+            if let Some(stored) = c.token.clone() {
+                if !stored.starts_with("dpapi:")
+                    && !stored.starts_with("keychain:")
+                    && !stored.starts_with("file:")
+                {
+                    if let Ok(env) = secrets::seal(stored.trim()) {
+                        c.token = Some(env);
+                    }
                 }
             }
+            let sealed = c.token.unwrap();
+            assert!(
+                sealed.starts_with("dpapi:")
+                    || sealed.starts_with("keychain:")
+                    || sealed.starts_with("file:"),
+                "sealed envelope expected, got: {sealed}"
+            );
+        });
+    }
+
+    #[test]
+    fn migration_persists_and_disk_ends_up_plaintext_free() {
+        // Regression for the v0.2.0 hot-fix: load() used to migrate the
+        // legacy token only in memory; if the app never saved again the
+        // plaintext stayed on disk forever. load() must write the sealed
+        // envelope back to the SAME file it was configured with.
+        with_scratch_config_home(|| {
+            let dir = std::env::temp_dir().join(format!("basalt-mig-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            std::fs::write(&path, "token = \"legacy-plaintext-token-xyz\"\n").unwrap();
+
+            let mut args = cli::Args::default();
+            args.config = Some(path.clone());
+            let cfg = Config::load(&args).unwrap();
+
+            // In memory: sealed envelope, unsealable back to the plaintext.
+            let envelope = cfg.token.clone().unwrap();
+            assert!(
+                envelope.starts_with("dpapi:")
+                    || envelope.starts_with("keychain:")
+                    || envelope.starts_with("file:"),
+                "in-memory migration failed, got: {envelope}"
+            );
+            assert_eq!(
+                cfg.plain_token().as_deref(),
+                Some("legacy-plaintext-token-xyz")
+            );
+
+            // On disk: no plaintext token survives the load.
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !on_disk.contains("legacy-plaintext-token-xyz"),
+                "plaintext token survived on disk: {on_disk}"
+            );
+            assert!(
+                on_disk.contains(&envelope),
+                "envelope not persisted: {on_disk}"
+            );
+
+            // And the round trip: a second load unseals the same token.
+            let cfg2 = Config::load(&args).unwrap();
+            assert_eq!(
+                cfg2.plain_token().as_deref(),
+                Some("legacy-plaintext-token-xyz")
+            );
+
+            // Reload-without-CLI still honors --config via cfg.path on save().
+            assert_eq!(cfg2.path.as_deref(), Some(path.as_path()));
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    /// Redirects XDG_CONFIG_HOME to a scratch dir for the duration of `f` so
+    /// tests that hit the real secret store (Linux: `seal` writes
+    /// `<config>/basalt/token.txt`) never clobber a developer's or user's
+    /// actual stored token. Serialized with a mutex because env is
+    /// process-global and tests run in parallel.
+    fn with_scratch_config_home(f: impl FnOnce()) {
+        use std::sync::{Mutex, MutexGuard};
+        static LOCK: Mutex<()> = Mutex::new(());
+        // Leak-free re-entrant guard: just lock for the whole call.
+        let _guard: MutexGuard<'_, ()> = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let scratch = std::env::temp_dir()
+            .join(format!("basalt-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let previous = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &scratch);
+        f();
+        match previous {
+            Some(old) => std::env::set_var("XDG_CONFIG_HOME", old),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
-        let sealed = c.token.unwrap();
-        assert!(
-            sealed.starts_with("dpapi:")
-                || sealed.starts_with("keychain:")
-                || sealed.starts_with("file:"),
-            "sealed envelope expected, got: {sealed}"
-        );
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[test]
