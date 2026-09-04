@@ -266,9 +266,10 @@ impl ImageCache {
                         global_cache().inner.lock().insert(key.clone(), handle);
                         global_cache().failed.lock().remove(&url);
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Mark the URL as failed so we stop retrying it this
                         // session; the placeholder texture stays in place.
+                        tracing::debug!(error = %e, "image fetch failed: {url}");
                         global_cache().failed.lock().insert(url, Instant::now());
                     }
                 }

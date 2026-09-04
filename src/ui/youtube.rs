@@ -5,7 +5,7 @@
 //! metadata comes from YouTube's public oEmbed endpoint (no API key),
 //! cached per URL in the app state.
 
-use egui::{Rect, Sense, Ui, Vec2};
+use egui::{Rect, Sense, Ui};
 
 use crate::colors;
 use crate::image_loader;
@@ -158,9 +158,19 @@ pub fn ensure_oembed(app_state: &AppState, url: &str, video_id: &str) {
     });
 }
 
-/// Draw the full video embed card (title clickable, thumbnail with play
-/// button). Skips itself while metadata + thumbnail are still loading
-/// (the row grows once, when both are ready).
+/// Draw the full video embed card (source + author line, clickable title,
+/// big thumbnail with a play button). Skips itself while metadata +
+/// thumbnail are still loading, so the row grows once when both are ready.
+///
+/// Layout contract: the card reserves its whole rect with ONE
+/// [`Ui::allocate_exact_size`] and paints everything through
+/// `ui.painter_at(rect)` - the exact pattern the GIF attachments use.
+/// A nested `Frame::show` must NOT be used here: egui gives ScrollArea
+/// content a viewport-bounded `max_rect`, and rows near the window edge
+/// hand `Frame::show` a zero-height region, which collapses the whole
+/// card (painted at height 0, no space reserved) even though every early
+/// gate passed. `allocate_exact_size` always reserves the exact size, so
+/// the row grows and the next messages are pushed down correctly.
 pub fn render(ui: &mut Ui, app_state: &AppState, url: &str, video_id: &str) {
     ensure_oembed(app_state, url, video_id);
     let Some(info) = app_state.oembed(url) else {
@@ -169,91 +179,91 @@ pub fn render(ui: &mut Ui, app_state: &AppState, url: &str, video_id: &str) {
     let Some(thumb) = info.thumbnail_url.clone() else {
         return;
     };
-    let cached = image_loader::global_cache()
+    if image_loader::global_cache()
         .get_or_fetch(ui.ctx(), &thumb, 800, 450, image_loader::Shape::Rounded(6))
-        .is_some();
-    if !cached {
+        .is_none()
+    {
         return; // grow the row only when the thumbnail is actually ready
     }
 
-    let card_w = 440.0_f32.min(ui.available_width() - 16.0).max(240.0);
-    let frame = egui::Frame::new()
-        .fill(colors::EMBED_BG)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin { left: 16, right: 12, top: 8, bottom: 8 });
-    let resp = frame.show(ui, |ui| {
-        ui.set_width(card_w);
-        ui.vertical(|ui| {
-            // Author line: YouTube + channel.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("YouTube")
-                        .size(12.0)
-                        .color(colors::RED)
-                        .strong(),
-                );
-                if let Some(author) = info.author_name.clone().filter(|a| !a.is_empty()) {
-                    ui.label(egui::RichText::new(author).size(12.0).color(colors::TEXT_TERTIARY));
-                }
-            });
-            // Title: clickable, opens the video in the browser.
-            let title = info.title.clone().unwrap_or_else(|| "Watch on YouTube".to_string());
-            if ui
-                .link(
-                    egui::RichText::new(title)
-                        .size(14.5)
-                        .color(colors::TEXT_LINK)
-                        .strong(),
-                )
-                .clicked()
-            {
-                let _ = open::that_detached(url);
-            }
-            ui.add_space(4.0);
-            // Thumbnail 440x248 (16:9) with the play button, painted INTO
-            // the one allocated rect (a second allocate would push the
-            // image below the button).
-            let thumb_size = Vec2::new(card_w - 28.0, ((card_w - 28.0) * 9.0 / 16.0).min(248.0));
-            let (rect, thumb_resp) = ui.allocate_exact_size(thumb_size, Sense::click());
-            let painter = ui.painter_at(rect);
-            if let Some(handle) = image_loader::global_cache().get_or_fetch(
-                ui.ctx(),
-                &thumb,
-                800,
-                450,
-                image_loader::Shape::Rounded(6),
-            ) {
-                let uv = egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0));
-                painter.image(handle.id(), rect, uv, egui::Color32::WHITE);
-            } else {
-                painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(0x38, 0x3A, 0x40));
-            }
-            // Play button: white disc + blurple triangle.
-            let center = rect.center();
-            let disc_r = (thumb_size.y * 0.16).clamp(20.0, 34.0);
-            painter.circle_filled(center, disc_r, egui::Color32::from_black_alpha(140));
-            painter.circle_filled(center, disc_r - 2.0, colors::TEXT_PRIMARY);
-            let tri = disc_r * 0.55;
-            let p1 = center + egui::vec2(-tri * 0.55, -tri);
-            let p2 = center + egui::vec2(-tri * 0.55, tri);
-            let p3 = center + egui::vec2(tri * 0.85, 0.0);
-            painter.add(egui::Shape::convex_polygon(
-                vec![p1, p2, p3],
-                colors::BLURPLE,
-                egui::Stroke::NONE,
-            ));
-            if thumb_resp.clicked() {
-                let _ = open::that_detached(url);
-            }
-        });
-    });
-    // Left stripe, YouTube red.
-    let cr = resp.response.rect;
-    ui.painter_at(cr).rect_filled(
-        Rect::from_min_max(egui::pos2(cr.min.x, cr.min.y), egui::pos2(cr.min.x + 4.0, cr.max.y)),
-        4.0,
-        colors::RED,
+    // ── Card geometry (computed BEFORE allocating, so the reserved rect
+    //    is final and nothing can shrink it later in the frame) ──
+    let card_w = 440.0_f32.min(ui.available_width().max(280.0) - 16.0).max(240.0);
+    let pad_l = 16.0;
+    let pad_r = 12.0;
+    let pad_t = 8.0;
+    let pad_b = 8.0;
+    let inner_w = (card_w - pad_l - pad_r).max(180.0);
+    let thumb_h = (inner_w * 9.0 / 16.0).min(248.0);
+    let card_h = pad_t + 17.0 /*source line*/ + 21.0 /*title*/ + 4.0 + thumb_h + pad_b;
+
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(card_w, card_h), Sense::click());
+    let p = ui.painter_at(rect);
+
+    // Card background + red left stripe (YouTube identity).
+    p.rect_filled(rect, 4.0, colors::EMBED_BG);
+    let stripe = Rect::from_min_max(
+        egui::pos2(rect.min.x, rect.min.y),
+        egui::pos2(rect.min.x + 4.0, rect.max.y),
     );
+    p.rect_filled(stripe, 4.0, colors::RED);
+
+    // Source line: "YouTube" + author.
+    let left = rect.min.x + pad_l;
+    let source_w = p
+        .layout("YouTube".to_string(), egui::FontId::proportional(12.0), colors::RED, 200.0)
+        .size()
+        .x;
+    let galley = p.layout("YouTube".to_string(), egui::FontId::proportional(12.0), colors::RED, 200.0);
+    p.galley(egui::pos2(left, rect.min.y + pad_t), galley, colors::RED);
+    let x = left + source_w + 6.0;
+    if let Some(author) = info.author_name.clone().filter(|a| !a.is_empty()) {
+        let g = p.layout(author, egui::FontId::proportional(12.0), colors::TEXT_TERTIARY, 200.0);
+        p.galley(egui::pos2(x, rect.min.y + pad_t), g, colors::TEXT_TERTIARY);
+    }
+
+    // Title: link-styled, one line, wrapped/ellipsized to the card width.
+    let title = info.title.clone().unwrap_or_else(|| "Watch on YouTube".to_string());
+    let galley = p.layout(title, egui::FontId::proportional(14.5), colors::TEXT_LINK, inner_w);
+    p.galley(egui::pos2(left, rect.min.y + pad_t + 18.0), galley, colors::TEXT_LINK);
+
+    // Thumbnail, painted into the reserved sub-rect.
+    let thumb_rect = Rect::from_min_size(
+        egui::pos2(left, rect.min.y + pad_t + 42.0),
+        egui::vec2(inner_w, thumb_h),
+    );
+    if let Some(handle) = image_loader::global_cache().get_or_fetch(
+        ui.ctx(),
+        &thumb,
+        800,
+        450,
+        image_loader::Shape::Rounded(6),
+    ) {
+        let uv = Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0));
+        p.image(handle.id(), thumb_rect, uv, egui::Color32::WHITE);
+    } else {
+        p.rect_filled(thumb_rect, 6.0, egui::Color32::from_rgb(0x38, 0x3A, 0x40));
+    }
+
+    // Play button: dark halo disc + white disc + blurple triangle.
+    let center = thumb_rect.center();
+    let disc_r = (thumb_h * 0.16).clamp(20.0, 34.0);
+    p.circle_filled(center, disc_r, egui::Color32::from_black_alpha(140));
+    p.circle_filled(center, disc_r - 2.0, colors::TEXT_PRIMARY);
+    let tri = disc_r * 0.55;
+    let p1 = center + egui::vec2(-tri * 0.55, -tri);
+    let p2 = center + egui::vec2(-tri * 0.55, tri);
+    let p3 = center + egui::vec2(tri * 0.85, 0.0);
+    p.add(egui::Shape::convex_polygon(
+        vec![p1, p2, p3],
+        colors::BLURPLE,
+        egui::Stroke::NONE,
+    ));
+
+    // The whole card is clickable (title + thumbnail both open the video).
+    if resp.clicked() {
+        let _ = open::that_detached(url);
+    }
     ui.add_space(4.0);
 }
 
