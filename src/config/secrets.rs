@@ -179,7 +179,7 @@ fn dpapi_protect(plain: &[u8]) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("CryptProtectData failed");
         }
         let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
-        windows_sys::Win32::System::Memory::LocalFree(out.pbData as _);
+        windows_sys::Win32::Foundation::LocalFree(out.pbData as _);
         Ok(bytes)
     }
 }
@@ -200,7 +200,7 @@ fn dpapi_unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
         };
         let ok = CryptUnprotectData(
             &mut in_blob,
-            std::ptr::null(),
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -211,7 +211,7 @@ fn dpapi_unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("CryptUnprotectData failed (wrong user or corrupted blob)");
         }
         let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
-        windows_sys::Win32::System::Memory::LocalFree(out.pbData as _);
+        windows_sys::Win32::Foundation::LocalFree(out.pbData as _);
         Ok(bytes)
     }
 }
